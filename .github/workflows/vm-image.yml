@@ -145,6 +145,16 @@ jobs:
                 "generator": "dump",
                 "path": "/etc/nix/nix.conf",
                 "content": "sandbox = true\nexperimental-features = nix-command flakes"
+              },
+              {
+                "generator": "copy",
+                "path": "/opt/home-manager-export.nar",
+                "source": "./home-manager-export.nar"
+              },
+              {
+                "generator": "copy",
+                "path": "/opt/home-manager-bin",
+                "source": "./home-manager-bin"
               }
             ]
             ' | yq -y '
@@ -166,6 +176,12 @@ jobs:
           mkdir -p /home/user/.config/systemd/user/default.target.wants
           ln -s /etc/systemd/user/sommelier.service /home/user/.config/systemd/user/default.target.wants/sommelier.service
           chown -R user: /home/user/.config
+
+          # Install bootstrapping copy of home-manager; It should be self-managing after initial install
+          nix-store --import < /opt/home-manager-export.nar
+          rm /opt/home-manager-export.nar
+          ln -s $(cat /opt/home-manager-bin) /opt/home-manager-bootstrap
+          rm /opt/home-manager-bin
 
           systemctl enable bubbles.service
           systemctl enable bubbles-proxy.service
@@ -270,6 +286,8 @@ jobs:
       - run: |
           nix-shell -p distrobuilder --command 'ln -s $(which distrobuilder) distrobuilder'
           nix-shell -p oras --command 'ln -s $(which oras) oras'
+          nix-shell -p home-manager --command 'which home-manager > home-manager-bin'
+          nix-store --export $(nix-store --query -R "$(cat home-manager-bin)") > home-manager-export.nar
           ls -lR usrlocalbin
           sudo ./distrobuilder build-incus ./debian.yaml debian-output --vm
           ls -lR debian-output
