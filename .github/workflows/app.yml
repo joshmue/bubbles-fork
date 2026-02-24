@@ -7,31 +7,11 @@ on:
     - "bubbles-app/**"
 
 jobs:
-  build-ui:
-    runs-on: ubuntu-latest
-    container: debian:trixie
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v5.0.0
-      - name: Install deps
-        run: |
-          apt-get update
-          apt-get install -y libgtk-4-dev libadwaita-1-dev cargo build-essential
-      - name: Build
-        run: |
-          cd bubbles-app/
-          cargo build --release
-      - name: 'Upload Artifact'
-        uses: actions/upload-artifact@v4
-        with:
-          name: bubbles
-          path: bubbles-app/target/release/bubbles
-          retention-days: 1
   build-crosvm:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout crosvm
-        uses: actions/checkout@v5.0.0
+        uses: actions/checkout@v5
         with:
           repository: google/crosvm
           fetch-depth: 0
@@ -154,57 +134,87 @@ jobs:
           git submodule update --init && tools/deps/install-x86_64-debs
           cargo build --release
       - name: 'Upload Artifact'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: crosvm
           path: target/release/crosvm
           retention-days: 1
-  build-dist:
-    needs:
-    - build-crosvm
-    - build-ui
+  build-tools:
+    runs-on: ubuntu-latest
+    container: debian:trixie
+    steps:
+      - name: Install tools
+        run: apt-get update && apt-get install -y --no-install-recommends socat qemu-utils
+      - name: Collect binaries and libs
+        run: |
+          mkdir -p prebuilt/lib
+          cp /usr/bin/socat1 prebuilt/socat
+          cp /usr/bin/qemu-img prebuilt/qemu-img
+          chmod +x prebuilt/socat prebuilt/qemu-img
+          SYSTEM_LIBS='linux-vdso|ld-linux|libc\.so|libm\.so|libdl\.so|librt\.so|libpthread\.so|libgcc_s\.so|libstdc\+\+'
+          DEPS=$(ldd prebuilt/socat prebuilt/qemu-img 2>/dev/null \
+            | grep '=> /' | awk '{print $3}' | sort -u)
+          for lib in $DEPS; do
+            libname=$(basename "$lib")
+            if ! echo "$libname" | grep -qE "$SYSTEM_LIBS"; then
+              cp "$lib" prebuilt/lib/
+            fi
+          done
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v5
+        with:
+          name: prebuilt-tools
+          path: prebuilt/
+          retention-days: 1
+
+  build-flatpak:
+    needs: [build-crosvm, build-tools]
     runs-on: ubuntu-latest
 
-    permissions:
-      contents: read
-      packages: write
     steps:
-      - name: Checkout
-        uses: actions/checkout@v5.0.0
-      - name: Download bubbles and crosvm
+      - uses: actions/checkout@v5
+
+      - name: Download crosvm
         uses: actions/download-artifact@v5
         with:
-          path: binaries
-          merge-multiple: true
-      - name: chmod binaries
-        run: |
-          chmod +x binaries/*
-      - run: |
-          cat > Dockerfile <<EOF
-          FROM debian:trixie
-          RUN apt-get update && apt-get install -y libgtk-4-dev libadwaita-1-dev socat oras
-          RUN mkdir -p /runtime_libs && cd /usr/lib/x86_64-linux-gnu && cp libadwaita-1.so libgtk-4.so libwrap.so.0 /runtime_libs
+          name: crosvm
+          path: bubbles-app/prebuilt
 
-          FROM busybox
-          WORKDIR /opt/artifacts
-          COPY --from=0 /runtime_libs runtime_libs
-          WORKDIR /opt/artifacts/bin
-          COPY binaries/crosvm .
-          COPY binaries/bubbles .
-          COPY --from=0 /usr/bin/socat1 ./socat
-          COPY --from=0 /usr/bin/oras .
-          COPY ./bubbles-app/scripts /opt/artifacts/scripts
-          VOLUME ["/output"]
-          ENTRYPOINT ["/bin/sh", "-c"]
-          CMD ["cp /opt/artifacts/bin/* /output && cp -r /opt/artifacts/runtime_libs /output && cp -r /opt/artifacts/scripts /output"]
-          EOF
-      - name: Log into registry
-        uses: docker/login-action@343f7c4344506bcbf9b4de18042ae17996df046d # v3.0.0
+      - name: Download tools
+        uses: actions/download-artifact@v5
         with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-      - name: Build and push
+          name: prebuilt-tools
+          path: bubbles-app/prebuilt
+
+      - name: Make binaries executable
+        run: chmod +x bubbles-app/prebuilt/crosvm bubbles-app/prebuilt/socat bubbles-app/prebuilt/qemu-img
+
+      - name: Install flatpak-builder
         run: |
-          docker build -t "ghcr.io/${{ github.repository }}/bubbles:${{ github.sha }}" .
-          docker push "ghcr.io/${{ github.repository }}/bubbles:${{ github.sha }}"
+          sudo apt-get install -y flatpak flatpak-builder
+          flatpak remote-add --user --if-not-exists flathub https://dl.flathub.org/repo/flathub.flatpakrepo
+          flatpak install --user -y org.gnome.Platform//49 org.gnome.Sdk//49 \
+            org.freedesktop.Sdk.Extension.rust-stable//25.08
+
+      - name: Generate Flatpak Cargo sources
+        run: |
+          sudo apt-get install -y python3-aiohttp python3-toml
+          curl -Lo flatpak-cargo-generator.py \
+            https://raw.githubusercontent.com/flatpak/flatpak-builder-tools/4d5e760321236bd96fc1c6db9ec94c336600c114/cargo/flatpak-cargo-generator.py
+          python3 flatpak-cargo-generator.py bubbles-app/Cargo.lock -o bubbles-app/cargo-sources.json
+
+      - name: Build Flatpak
+        run: |
+          flatpak-builder --user --install --force-clean build-dir \
+            bubbles-app/de.gonicus.Bubbles.json
+
+      - name: Bundle Flatpak
+        run: |
+          flatpak build-bundle ~/.local/share/flatpak/repo \
+            de.gonicus.Bubbles.flatpak de.gonicus.Bubbles
+
+      - name: Upload bundle
+        uses: actions/upload-artifact@v5
+        with:
+          name: de.gonicus.Bubbles.flatpak
+          path: de.gonicus.Bubbles.flatpak
