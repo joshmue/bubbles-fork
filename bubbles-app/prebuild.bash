@@ -1,46 +1,112 @@
 #!/bin/bash
 #
-# prebuild.bash — Populate prebuilt/ for local (non-CI) Flatpak builds
+# prebuild.bash — Produce prebuilt/ artifacts for Flatpak builds
 #
-# Installs socat and qemu-img inside a Debian Trixie container via apt
-# (which verifies package signatures), then copies the binaries and their
-# runtime library dependencies out. Same approach as the build-tools
-# job in .github/workflows/app.yml.
+# Builds crosvm (with patches), extracts socat + qemu-img from Debian Trixie,
+# and generates cargo-sources.json for offline Cargo builds. This script is
+# the single source of truth — both local builds and CI use it.
 #
 # Usage:
-#   CROSVM=~/bubbles/crosvm ./prebuild.bash
+#   ./prebuild.bash                        # Build everything (crosvm from source)
+#   CROSVM=~/bubbles/crosvm ./prebuild.bash  # Use pre-built crosvm binary
 #
 # Environment variables:
-#   CROSVM  - path to a pre-built crosvm binary (required)
+#   CROSVM  - path to a pre-built crosvm binary (skips crosvm build)
 #
-# Requirements: podman, curl
+# Requirements: podman, git, sha256sum
 
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PREBUILT_DIR="$SCRIPT_DIR/prebuilt"
-CONTAINER_NAME="bubbles-prebuild-$$"
+PATCHES_DIR="$SCRIPT_DIR/patches/crosvm"
+
+# --- crosvm source configuration ---
+CROSVM_COMMIT="a96cb379acf55a75887cbba190666e7d22ff9dbf"
+CROSVM_REVERTS=(
+    1656a1f68296baa4313b4b46e23a6c975caa7cc9
+    2c6f23406c41af8432c1c1ba4e3605785e959ead
+    806e91d2fa5416b3444257e42421e07b318e26d6
+    ff4b721ac8b983393b0fa503000eff74ecd3de2e
+    a96cb379acf55a75887cbba190666e7d22ff9dbf
+)
+
+# --- Container names (for cleanup) ---
+TOOLS_CONTAINER="bubbles-prebuild-tools-$$"
+CROSVM_CONTAINER="bubbles-prebuild-crosvm-$$"
+TMPDIR_CROSVM=""
 
 cleanup() {
-    podman rm -f "$CONTAINER_NAME" 2>/dev/null || true
+    podman rm -f "$TOOLS_CONTAINER" 2>/dev/null || true
+    podman rm -f "$CROSVM_CONTAINER" 2>/dev/null || true
+    if [ -n "$TMPDIR_CROSVM" ] && [ -d "$TMPDIR_CROSVM" ]; then
+        rm -rf "$TMPDIR_CROSVM"
+    fi
 }
 trap cleanup EXIT
 
 mkdir -p "$PREBUILT_DIR" "$PREBUILT_DIR/lib"
 
 # ---------------------------------------------------------------------------
-# crosvm — must be provided; build instructions in .github/workflows/app.yml
+# crosvm — build from source or copy pre-built binary
 # ---------------------------------------------------------------------------
+crosvm_cache_key() {
+    local reverts_str
+    reverts_str=$(printf '%s\n' "${CROSVM_REVERTS[@]}")
+    local patches_hash
+    patches_hash=$(cat "$PATCHES_DIR"/*.patch 2>/dev/null | sha256sum | awk '{print $1}')
+    echo -n "${CROSVM_COMMIT}:${reverts_str}:${patches_hash}" | sha256sum | awk '{print $1}'
+}
+
 if [ -n "${CROSVM:-}" ]; then
     echo "==> crosvm: copying from ${CROSVM}"
     install -m755 "$CROSVM" "$PREBUILT_DIR/crosvm"
     echo "    → prebuilt/crosvm"
 else
-    echo "ERROR: crosvm binary not found." >&2
-    echo "  Set CROSVM=/path/to/binary, e.g.:" >&2
-    echo "    CROSVM=~/bubbles/crosvm $0" >&2
-    echo "  Build instructions: .github/workflows/app.yml (build-crosvm job)" >&2
-    exit 1
+    CACHE_KEY=$(crosvm_cache_key)
+    CACHE_FILE="$PREBUILT_DIR/.crosvm-cache-key"
+
+    if [ -f "$PREBUILT_DIR/crosvm" ] && [ -f "$CACHE_FILE" ] && [ "$(cat "$CACHE_FILE")" = "$CACHE_KEY" ]; then
+        echo "==> crosvm: cached, skipping (key: ${CACHE_KEY:0:12}…)"
+    else
+        echo "==> crosvm: building from source (commit ${CROSVM_COMMIT:0:12}…)"
+        TMPDIR_CROSVM=$(mktemp -d)
+
+        echo "    Cloning crosvm..."
+        git clone --quiet https://chromium.googlesource.com/crosvm/crosvm "$TMPDIR_CROSVM/crosvm"
+        cd "$TMPDIR_CROSVM/crosvm"
+
+        git config user.email "prebuild@bubbles"
+        git config user.name "prebuild"
+        git checkout --quiet "$CROSVM_COMMIT"
+
+        echo "    Reverting commits..."
+        git revert --no-edit "${CROSVM_REVERTS[@]}"
+
+        echo "    Applying patches..."
+        for patch in "$PATCHES_DIR"/*.patch; do
+            echo "      $(basename "$patch")"
+            git apply "$patch"
+        done
+
+        echo "    Initializing submodules..."
+        git submodule update --init
+
+        echo "    Building in container (this may take a while)..."
+        podman run -d --name "$CROSVM_CONTAINER" \
+            -v "$TMPDIR_CROSVM/crosvm:/src:Z" \
+            rust:trixie sleep infinity
+
+        podman exec "$CROSVM_CONTAINER" bash -c \
+            'cd /src && apt-get update && sed -i "s/sudo //" tools/deps/install-x86_64-debs && tools/deps/install-x86_64-debs && cargo build --release'
+
+        podman cp "$CROSVM_CONTAINER:/src/target/release/crosvm" "$PREBUILT_DIR/crosvm"
+        chmod +x "$PREBUILT_DIR/crosvm"
+        echo "$CACHE_KEY" > "$CACHE_FILE"
+
+        cd "$SCRIPT_DIR"
+        echo "    → prebuilt/crosvm"
+    fi
 fi
 
 # ---------------------------------------------------------------------------
@@ -50,14 +116,14 @@ fi
 # ---------------------------------------------------------------------------
 echo "==> Setting up Debian Trixie container..."
 
-podman run -d --name "$CONTAINER_NAME" debian:trixie sleep infinity
-podman exec "$CONTAINER_NAME" sh -c \
+podman run -d --name "$TOOLS_CONTAINER" debian:trixie sleep infinity
+podman exec "$TOOLS_CONTAINER" sh -c \
     'apt-get update && apt-get install -y --no-install-recommends socat qemu-utils'
 
 # Copy binaries
 echo "==> Copying binaries..."
-podman cp "$CONTAINER_NAME:/usr/bin/socat1"   "$PREBUILT_DIR/socat"
-podman cp "$CONTAINER_NAME:/usr/bin/qemu-img" "$PREBUILT_DIR/qemu-img"
+podman cp "$TOOLS_CONTAINER:/usr/bin/socat1"   "$PREBUILT_DIR/socat"
+podman cp "$TOOLS_CONTAINER:/usr/bin/qemu-img" "$PREBUILT_DIR/qemu-img"
 chmod +x "$PREBUILT_DIR/socat" "$PREBUILT_DIR/qemu-img"
 echo "    → prebuilt/socat"
 echo "    → prebuilt/qemu-img"
@@ -68,7 +134,7 @@ echo "==> Copying runtime libraries..."
 # Libraries that are part of glibc or universally present — skip these
 SYSTEM_LIBS="linux-vdso|ld-linux|libc\.so|libm\.so|libdl\.so|librt\.so|libpthread\.so|libgcc_s\.so|libstdc\+\+"
 
-DEPS=$(podman exec "$CONTAINER_NAME" sh -c \
+DEPS=$(podman exec "$TOOLS_CONTAINER" sh -c \
     'ldd /usr/bin/socat1 /usr/bin/qemu-img 2>/dev/null \
      | grep "=> /" | awk "{print \$3}" | sort -u')
 
@@ -77,7 +143,7 @@ for lib in $DEPS; do
     if echo "$libname" | grep -qE "$SYSTEM_LIBS"; then
         continue
     fi
-    podman cp "$CONTAINER_NAME:$lib" "$PREBUILT_DIR/lib/$libname"
+    podman cp "$TOOLS_CONTAINER:$lib" "$PREBUILT_DIR/lib/$libname"
     echo "    → prebuilt/lib/$libname"
 done
 
@@ -90,16 +156,16 @@ if [ -f "$SCRIPT_DIR/cargo-sources.json" ]; then
     echo "==> cargo-sources.json already exists, skipping"
 else
     echo "==> Generating cargo-sources.json (inside container)..."
-    podman exec "$CONTAINER_NAME" sh -c \
+    podman exec "$TOOLS_CONTAINER" sh -c \
         'apt-get install -y --no-install-recommends python3 python3-aiohttp python3-tomlkit curl 2>/dev/null'
     curl -fsSL -o "$SCRIPT_DIR/.flatpak-cargo-generator.py" \
         https://raw.githubusercontent.com/flatpak/flatpak-builder-tools/4d5e760321236bd96fc1c6db9ec94c336600c114/cargo/flatpak-cargo-generator.py
-    podman cp "$SCRIPT_DIR/Cargo.lock"                    "$CONTAINER_NAME:/tmp/Cargo.lock"
-    podman cp "$SCRIPT_DIR/.flatpak-cargo-generator.py"   "$CONTAINER_NAME:/tmp/flatpak-cargo-generator.py"
+    podman cp "$SCRIPT_DIR/Cargo.lock"                    "$TOOLS_CONTAINER:/tmp/Cargo.lock"
+    podman cp "$SCRIPT_DIR/.flatpak-cargo-generator.py"   "$TOOLS_CONTAINER:/tmp/flatpak-cargo-generator.py"
     rm -f "$SCRIPT_DIR/.flatpak-cargo-generator.py"
-    podman exec "$CONTAINER_NAME" \
+    podman exec "$TOOLS_CONTAINER" \
         python3 /tmp/flatpak-cargo-generator.py /tmp/Cargo.lock -o /tmp/cargo-sources.json
-    podman cp "$CONTAINER_NAME:/tmp/cargo-sources.json" "$SCRIPT_DIR/cargo-sources.json"
+    podman cp "$TOOLS_CONTAINER:/tmp/cargo-sources.json" "$SCRIPT_DIR/cargo-sources.json"
     echo "    → cargo-sources.json"
 fi
 
