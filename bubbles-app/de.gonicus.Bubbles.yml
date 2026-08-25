@@ -132,6 +132,8 @@ modules:
     build-commands:
       - cargo --offline build --release
       - install -Dm755 target/release/bubbles /app/bin/bubbles
+      # What the launchers installed by the Dynamic Launcher Portal run.
+      - install -Dm755 target/release/bubbles-launch /app/bin/bubbles-launch
       - install -Dm644 de.gonicus.Bubbles.desktop /app/share/applications/de.gonicus.Bubbles.desktop
       - install -Dm644 de.gonicus.Bubbles.appdata.xml /app/share/metainfo/de.gonicus.Bubbles.appdata.xml
       - install -Dm644 de.gonicus.Bubbles.svg /app/share/icons/hicolor/scalable/apps/de.gonicus.Bubbles.svg

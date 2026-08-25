@@ -165,6 +165,11 @@ jobs:
               },
               {
                 "generator": "copy",
+                "path": "/etc/chromium.d/10-bubbles-wayland",
+                "source": "./etcchromiumd10bubbleswayland"
+              },
+              {
+                "generator": "copy",
                 "path": "/opt/home-manager-export.nar",
                 "source": "./home-manager-export.nar"
               },
@@ -217,6 +222,14 @@ jobs:
           [Service]
           ExecStart=/usr/local/bin/bubbles-agent
           User=user
+          # Applications the agent starts run under sommelier, which offers
+          # Wayland and no X server. Qt5 in particular still defaults to X11.
+          Environment=QT_QPA_PLATFORM=wayland
+          Environment=ELECTRON_OZONE_PLATFORM_HINT=auto
+          Environment=SDL_VIDEODRIVER=wayland
+          Environment=CLUTTER_BACKEND=wayland
+          Environment=MOZ_ENABLE_WAYLAND=1
+          Environment=_JAVA_AWT_WM_NONREPARENTING=1
 
           [Install]
           WantedBy=multi-user.target
@@ -273,6 +286,12 @@ jobs:
 
           [DHCP]
           ClientIdentifier=mac
+          EOF
+
+          # Debian's /usr/bin/chromium wrapper sources /etc/chromium.d, so this
+          # reaches Chromium without touching its .desktop file.
+          cat > etcchromiumd10bubbleswayland <<EOF
+          export CHROMIUM_FLAGS="\$CHROMIUM_FLAGS --ozone-platform=wayland"
           EOF
 
           cat > etcdconfprofileuser <<EOF

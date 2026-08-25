@@ -1,3 +1,6 @@
+mod apps;
+mod exports;
+mod portal;
 mod preferences;
 
 use relm4::adw::prelude::*;
@@ -12,9 +15,11 @@ use relm4::factory::DynamicIndex;
 use std::{env, fs, path::{Path, PathBuf}, ffi::{OsStr, OsString}};
 use libc::SIGTERM;
 use serde::{Deserialize, Serialize};
-use tokio::io::{AsyncWriteExt, AsyncReadExt};
 
+use apps::{AppsDialog, AppsMsg};
 use preferences::{BubbleSettingsDialog, BubbleSettingsMsg, BubbleSettingsOutput};
+
+pub use bubbles::{get_data_dir, is_flatpak, unix_request, vsock_path};
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct BubbleConfig {
@@ -51,17 +56,6 @@ pub fn save_config(vm_name: &str, config: &BubbleConfig) {
     let path = config_path(vm_name);
     let data = serde_json::to_string_pretty(config).expect("config to serialize");
     fs::write(path, data).expect("config to be written");
-}
-
-pub fn get_data_dir() -> PathBuf {
-    let base = env::var("XDG_DATA_HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from(env::var("HOME").expect("HOME")).join(".local/share"));
-    base.join("bubbles")
-}
-
-fn is_flatpak() -> bool {
-    Path::new("/.flatpak-info").exists()
 }
 
 fn make_host_args(args: &[&OsStr]) -> Vec<OsString> {
@@ -105,19 +99,6 @@ fn wayland_sock_path() -> PathBuf {
     }
 }
 
-async fn unix_http(socket: &Path, method: &str, path: &str) -> std::io::Result<String> {
-    let mut stream = tokio::net::UnixStream::connect(socket).await?;
-    // Content-Length: 0 included for POST correctness; harmless on GET
-    let req = format!(
-        "{} {} HTTP/1.0\r\nHost: localhost\r\nContent-Length: 0\r\n\r\n",
-        method, path
-    );
-    stream.write_all(req.as_bytes()).await?;
-    let mut buf = Vec::new();
-    stream.read_to_end(&mut buf).await?;
-    Ok(String::from_utf8_lossy(&buf).into_owned())
-}
-
 struct CreateBubbleDialog {
 }
 
@@ -155,8 +136,8 @@ pub async fn wait_until_exists(file_path: &Path) {
 
 pub async fn wait_until_ready(vsock_socket_path: &Path) {
     loop {
-        match unix_http(vsock_socket_path, "GET", "/ready").await {
-            Ok(response) if response.contains("200") => return,
+        match unix_request(vsock_socket_path, "GET", "/ready").await {
+            Ok(response) if response.status == 200 => return,
             _ => {
                 tokio::time::sleep(std::time::Duration::from_millis(500)).await;
             }
@@ -165,11 +146,11 @@ pub async fn wait_until_ready(vsock_socket_path: &Path) {
 }
 
 pub async fn request_shutdown(vsock_socket_path: &Path) {
-    unix_http(vsock_socket_path, "POST", "/shutdown").await.ok();
+    unix_request(vsock_socket_path, "POST", "/shutdown").await.ok();
 }
 
 pub async fn request_terminal(vsock_socket_path: &Path) {
-    unix_http(vsock_socket_path, "POST", "/spawn-terminal").await.ok();
+    unix_request(vsock_socket_path, "POST", "/spawn-terminal").await.ok();
 }
 
 // Pinned VM image release. Bump both when publishing a new vm-image-* release:
@@ -363,6 +344,7 @@ struct App {
     create_bubble_dialog: Controller<CreateBubbleDialog>,
     warn_close_dialog: Controller<WarnCloseDialog>,
     settings_dialog: Controller<BubbleSettingsDialog>,
+    apps_dialog: Controller<AppsDialog>,
     currently_creating_bubble: bool,
     image_status: ImageStatus,
     root: relm4::adw::Window,
@@ -419,12 +401,14 @@ enum VmMsg {
     PowerToggle(DynamicIndex),
     StartTerminal(DynamicIndex),
     OpenSettings(DynamicIndex),
+    OpenApplications(DynamicIndex),
 }
 
 #[derive(Debug)]
 enum VmStateUpdate {
     Update(DynamicIndex, VMStatus),
     OpenSettings(String),
+    OpenApplications(String),
 }
 
 #[derive(PartialEq, Debug)]
@@ -487,8 +471,22 @@ impl AsyncFactoryComponent for VmEntry {
                     #[watch]
                     set_sensitive: self.value.status == VMStatus::Running,
                     set_icon_name: "utilities-terminal-symbolic",
+                    set_tooltip_text: Some("Terminal"),
                     connect_clicked[sender, index] => move |_| {
                         sender.input(VmMsg::StartTerminal(index.clone()));
+                    }
+                },
+                append = &gtk::Button {
+                    #[watch]
+                    set_sensitive: portal::available() && self.value.status == VMStatus::Running,
+                    set_icon_name: "view-grid-symbolic",
+                    set_tooltip_text: Some(if portal::available() {
+                        "Applications"
+                    } else {
+                        "This desktop's portal cannot install application launchers"
+                    }),
+                    connect_clicked[sender, index] => move |_| {
+                        sender.input(VmMsg::OpenApplications(index.clone()));
                     }
                 },
             }
@@ -505,10 +503,13 @@ impl AsyncFactoryComponent for VmEntry {
     async fn update(&mut self, msg: Self::Input, sender: AsyncFactorySender<Self>) {
         let vm_name: String = self.value.name.clone();
         let image_base_path = get_data_dir().join("vms").join(vm_name.clone());
-        let vsock_socket_path = image_base_path.join("vsock");
+        let vsock_socket_path = vsock_path(&vm_name);
         match msg {
             VmMsg::OpenSettings(_index) => {
                 sender.output(VmStateUpdate::OpenSettings(vm_name)).unwrap();
+            },
+            VmMsg::OpenApplications(_index) => {
+                sender.output(VmStateUpdate::OpenApplications(vm_name)).unwrap();
             },
             VmMsg::PowerToggle(index) => {
                 match self.value.status {
@@ -660,6 +661,7 @@ enum AppMsg {
     FinishBubbleCreation,
     CloseApplication,
     OpenBubbleSettings(String),
+    OpenBubbleApplications(String),
     DeleteBubble(String),
 }
 
@@ -778,6 +780,7 @@ impl SimpleComponent for App {
                 .forward(sender.input_sender(), |output| match output {
                     VmStateUpdate::Update(index, status_update) => AppMsg::HandleVMStatusUpdate(index, status_update),
                     VmStateUpdate::OpenSettings(name) => AppMsg::OpenBubbleSettings(name),
+                    VmStateUpdate::OpenApplications(name) => AppMsg::OpenBubbleApplications(name),
                 });
         let create_bubble_dialog = CreateBubbleDialog::builder()
             .launch(())
@@ -794,12 +797,14 @@ impl SimpleComponent for App {
             .forward(sender.input_sender(), |output| match output {
                 BubbleSettingsOutput::DeleteBubble(name) => AppMsg::DeleteBubble(name),
             });
+        let apps_dialog = AppsDialog::builder().launch(()).detach();
 
         let mut model = App {
             vms,
             create_bubble_dialog,
             warn_close_dialog,
             settings_dialog,
+            apps_dialog,
             root: root.clone(),
             currently_creating_bubble: false,
             image_status: determine_download_status(),
@@ -860,7 +865,14 @@ impl SimpleComponent for App {
                 self.settings_dialog.sender().send(BubbleSettingsMsg::Load(name)).unwrap();
                 self.settings_dialog.widgets().dialog.present(Some(&self.root));
             }
+            AppMsg::OpenBubbleApplications(name) => {
+                self.apps_dialog.sender().send(AppsMsg::Load(name)).unwrap();
+                self.apps_dialog.widgets().dialog.present(Some(&self.root));
+            }
             AppMsg::DeleteBubble(name) => {
+                // Read the ids before the directory holding them is removed.
+                let launchers: Vec<String> = exports::load(&name).into_keys().collect();
+                relm4::spawn_local(apps::uninstall_launchers(launchers));
                 let vm_dir = get_data_dir().join("vms").join(&name);
                 let _ = fs::remove_dir_all(&vm_dir);
                 let mut guard = self.vms.guard();
