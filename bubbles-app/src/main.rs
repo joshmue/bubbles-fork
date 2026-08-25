@@ -1,3 +1,8 @@
+mod agents;
+mod apps;
+mod exports;
+mod launcher;
+mod portal;
 mod preferences;
 mod config;
 
@@ -17,15 +22,12 @@ use std::os::unix::net::UnixStream;
 use std::net::{Ipv4Addr, SocketAddr, TcpListener};
 use libc::SIGTERM;
 
+use apps::{AppsDialog, AppsMsg};
 use preferences::{BubbleSettingsDialog, BubbleSettingsMsg, BubbleSettingsOutput};
 
+use bubbles::agent_request;
+use hyper::Method;
 
-pub fn get_data_dir() -> PathBuf {
-    let base = env::var("XDG_DATA_HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from(env::var("HOME").expect("HOME")).join(".local/share"));
-    base.join("bubbles")
-}
 
 // static FD numbers
 // stdio uses 0, 1, 2; start at 3
@@ -379,6 +381,7 @@ struct App {
     create_bubble_dialog: Controller<CreateBubbleDialog>,
     warn_close_dialog: Controller<WarnCloseDialog>,
     settings_dialog: Controller<BubbleSettingsDialog>,
+    apps_dialog: Controller<AppsDialog>,
     currently_creating_bubble: bool,
     image_status: ImageStatus,
     root: relm4::adw::Window,
@@ -447,12 +450,14 @@ enum VmMsg {
     PowerToggle(DynamicIndex),
     StartTerminal(DynamicIndex),
     OpenSettings(DynamicIndex),
+    OpenApplications(DynamicIndex),
 }
 
 #[derive(Debug)]
 enum VmStateUpdate {
     Update(DynamicIndex, VMStatus),
     OpenSettings(String),
+    OpenApplications(String),
 }
 
 #[derive(PartialEq, Debug)]
@@ -518,6 +523,19 @@ impl AsyncFactoryComponent for VmEntry {
                         sender.input(VmMsg::StartTerminal(index.clone()));
                     }
                 },
+                append = &gtk::Button {
+                    #[watch]
+                    set_sensitive: portal::available() && self.value.status == VMStatus::Running,
+                    set_icon_name: "view-grid-symbolic",
+                    set_tooltip_text: Some(if portal::available() {
+                        "Applications"
+                    } else {
+                        "This desktop's portal cannot install application launchers"
+                    }),
+                    connect_clicked[sender, index] => move |_| {
+                        sender.input(VmMsg::OpenApplications(index.clone()));
+                    }
+                },
             }
         }
     }
@@ -535,6 +553,9 @@ impl AsyncFactoryComponent for VmEntry {
         match msg {
             VmMsg::OpenSettings(_index) => {
                 sender.output(VmStateUpdate::OpenSettings(vm_name)).unwrap();
+            },
+            VmMsg::OpenApplications(_index) => {
+                sender.output(VmStateUpdate::OpenApplications(vm_name)).unwrap();
             },
             VmMsg::PowerToggle(index) => {
                 match self.value.status {
@@ -696,8 +717,11 @@ impl AsyncFactoryComponent for VmEntry {
                             );
 
                             wait_until_ready(agent_addr).await;
+                            // Only now can a launcher reach it.
+                            agents::set(&vm_name, agent_addr);
                             sender.output(VmStateUpdate::Update(index.clone(), VMStatus::Running)).unwrap();
                             crosvm_process.wait_future().await.expect("vm to stop");
+                            agents::clear(&vm_name);
                             passt_process.send_signal(SIGTERM); // Marker: Incompatible with Windows
                             gpu_process.send_signal(SIGTERM);
                             passt_process.wait_future().await.expect("passt to stop");
@@ -728,6 +752,7 @@ enum AppMsg {
     FinishBubbleCreation,
     CloseApplication,
     OpenBubbleSettings(String),
+    OpenBubbleApplications(String),
     DeleteBubble(String),
 }
 
@@ -846,6 +871,7 @@ impl SimpleComponent for App {
                 .forward(sender.input_sender(), |output| match output {
                     VmStateUpdate::Update(index, status_update) => AppMsg::HandleVMStatusUpdate(index, status_update),
                     VmStateUpdate::OpenSettings(name) => AppMsg::OpenBubbleSettings(name),
+                    VmStateUpdate::OpenApplications(name) => AppMsg::OpenBubbleApplications(name),
                 });
         let create_bubble_dialog = CreateBubbleDialog::builder()
             .launch(())
@@ -862,12 +888,14 @@ impl SimpleComponent for App {
             .forward(sender.input_sender(), |output| match output {
                 BubbleSettingsOutput::DeleteBubble(name) => AppMsg::DeleteBubble(name),
             });
+        let apps_dialog = AppsDialog::builder().launch(()).detach();
 
         let mut model = App {
             vms,
             create_bubble_dialog,
             warn_close_dialog,
             settings_dialog,
+            apps_dialog,
             root: root.clone(),
             currently_creating_bubble: false,
             image_status: determine_download_status(),
@@ -937,7 +965,14 @@ impl SimpleComponent for App {
                 self.settings_dialog.sender().send(BubbleSettingsMsg::Load(name)).unwrap();
                 self.settings_dialog.widgets().dialog.present(Some(&self.root));
             }
+            AppMsg::OpenBubbleApplications(name) => {
+                self.apps_dialog.sender().send(AppsMsg::Load(name)).unwrap();
+                self.apps_dialog.widgets().dialog.present(Some(&self.root));
+            }
             AppMsg::DeleteBubble(name) => {
+                // Read the ids before the directory holding them is removed.
+                let launchers: Vec<String> = exports::load(&name).into_keys().collect();
+                relm4::spawn_local(apps::uninstall_launchers(launchers));
                 let vm_dir = config::get_data_dir().join("vms").join(&name);
                 let _ = fs::remove_dir_all(&vm_dir);
                 let mut guard = self.vms.guard();

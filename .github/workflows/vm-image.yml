@@ -149,6 +149,11 @@ jobs:
               },
               {
                 "generator": "copy",
+                "path": "/etc/chromium.d/10-bubbles-wayland",
+                "source": "./etcchromiumd10bubbleswayland"
+              },
+              {
+                "generator": "copy",
                 "path": "/opt/home-manager-export.nar",
                 "source": "./home-manager-export.nar"
               },
@@ -222,6 +227,12 @@ jobs:
 
           [DHCP]
           ClientIdentifier=mac
+          EOF
+
+          # Debian's /usr/bin/chromium wrapper sources /etc/chromium.d, so this
+          # reaches Chromium without touching its .desktop file.
+          cat > etcchromiumd10bubbleswayland <<EOF
+          export CHROMIUM_FLAGS="\$CHROMIUM_FLAGS --ozone-platform=wayland"
           EOF
 
           cat > etcdconfprofileuser <<EOF
