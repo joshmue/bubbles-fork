@@ -78,6 +78,7 @@ jobs:
               "git",
               "unzip",
               "gnome-console",
+              "gnome-software",
               "libgbm1",
               "libpixman-1-0",
               "libwayland-client0",
@@ -88,6 +89,7 @@ jobs:
               "libglib2.0-bin",
               "docker.io",
               "dconf-cli",
+              "dbus-user-session",
               "nix-bin"
             ]}]
             ' | yq -y '
@@ -146,6 +148,16 @@ jobs:
                 "generator": "dump",
                 "path": "/etc/nix/nix.conf",
                 "content": "sandbox = true\nexperimental-features = nix-command flakes"
+              },
+              {
+                "generator": "dump",
+                "path": "/etc/polkit-1/rules.d/50-bubbles.rules",
+                "content": "polkit.addRule(function(action, subject) {\n    if (subject.isInGroup(\"sudo\")) {\n        return polkit.Result.YES;\n    }\n});\n"
+              },
+              {
+                "generator": "copy",
+                "path": "/etc/chromium.d/10-bubbles-wayland",
+                "source": "./etcchromiumd10bubbleswayland"
               },
               {
                 "generator": "copy",
@@ -222,6 +234,12 @@ jobs:
 
           [DHCP]
           ClientIdentifier=mac
+          EOF
+
+          # Debian's /usr/bin/chromium wrapper sources /etc/chromium.d, so this
+          # reaches Chromium without touching its .desktop file.
+          cat > etcchromiumd10bubbleswayland <<EOF
+          export CHROMIUM_FLAGS="\$CHROMIUM_FLAGS --ozone-platform=wayland"
           EOF
 
           cat > etcdconfprofileuser <<EOF
