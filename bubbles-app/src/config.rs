@@ -1,5 +1,7 @@
 use serde::{Deserialize, Serialize};
-use std::{env, fs, path::{PathBuf}};
+use std::{fs, path::PathBuf};
+
+pub use bubbles::get_data_dir;
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct BubbleConfig {
@@ -18,10 +20,6 @@ impl Default for BubbleConfig {
             map_host_loopback: false,
         }
     }
-}
-
-pub fn get_data_dir() -> PathBuf {
-    PathBuf::from(env::var("XDG_DATA_HOME").expect("XDG_DATA_HOME")).join("bubbles")
 }
 
 fn config_path(vm_name: &str) -> PathBuf {
