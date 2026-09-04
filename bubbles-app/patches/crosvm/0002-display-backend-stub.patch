@@ -25,3 +25,31 @@ index 7bb3ff7af..7eba55ee7 100644
      let dev = virtio::Gpu::new(
          exit_evt_wrtube
              .try_clone()
+diff --git a/devices/src/virtio/vhost_user_backend/gpu/sys/linux.rs b/devices/src/virtio/vhost_user_backend/gpu/sys/linux.rs
+index 8534e90fc..9b5aae980 100644
+--- a/devices/src/virtio/vhost_user_backend/gpu/sys/linux.rs
++++ b/devices/src/virtio/vhost_user_backend/gpu/sys/linux.rs
+@@ -158,7 +158,7 @@ pub struct Options {
+ 
+ pub fn run_gpu_device(opts: Options) -> anyhow::Result<()> {
+     let Options {
+-        x_display,
++        x_display: _,
+         params: mut gpu_parameters,
+         resource_bridge,
+         socket,
+@@ -222,13 +222,7 @@ pub fn run_gpu_device(opts: Options) -> anyhow::Result<()> {
+ 
+     let (gpu_control_tube, _) = Tube::pair().context("failed to create gpu control tube")?;
+ 
+-    let mut display_backends = vec![
+-        virtio::DisplayBackend::X(x_display),
+-        virtio::DisplayBackend::Stub,
+-    ];
+-    if let Some(p) = channels.get("") {
+-        display_backends.insert(0, virtio::DisplayBackend::Wayland(Some(p.to_owned())));
+-    }
++    let display_backends = vec![virtio::DisplayBackend::Stub];
+ 
+     // These are only used when there is an input device.
+     let event_devices = Vec::new();

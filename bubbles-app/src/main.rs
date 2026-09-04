@@ -10,6 +10,8 @@ use relm4::{
 };
 use relm4::factory::DynamicIndex;
 use std::{env, fs, path::{Path, PathBuf}, ffi::{OsStr, OsString}};
+use std::os::fd::{BorrowedFd, OwnedFd};
+use std::os::unix::net::UnixStream;
 use libc::SIGTERM;
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncWriteExt, AsyncReadExt};
@@ -79,6 +81,63 @@ fn make_host_args(args: &[&OsStr]) -> Vec<OsString> {
     }
 }
 
+// Each vhost-user link gets one number, used by both its ends, since it is
+// baked into their argv. 3 is the first descriptor free after stdio.
+const GPU_VHOST_FD: i32 = 3;
+const NET_VHOST_FD: i32 = 4;
+
+const SANDBOX_DISPLAY: u32 = 1;
+const SANDBOX_GPU: u32 = 4;
+
+enum SandboxNet { Denied, Shared }
+
+fn vhost_user_pair() -> (OwnedFd, OwnedFd) {
+    let (backend, frontend) = UnixStream::pair().expect("socketpair for the vhost-user link");
+    (backend.into(), frontend.into())
+}
+
+fn spawn_with_fds(argv: &[&OsStr], fds: Vec<(OwnedFd, i32)>) -> gtk::gio::Subprocess {
+    let launcher = gtk::gio::SubprocessLauncher::new(SubprocessFlags::empty());
+    for (fd, target) in fds {
+        // SAFETY: take_fd() only reads the target's number, to dup2() onto it in
+        // the child. It never touches a descriptor of ours at that index.
+        launcher.take_fd(fd, unsafe { BorrowedFd::borrow_raw(target) });
+    }
+    launcher.spawn(argv).expect("start of vhost-user process")
+}
+
+// Run the argv in a portal sub-sandbox, which holds none of our permissions
+// except the `flags` bits. Network is not one of those bits, so it stays shared
+// unless denied here. bwrap refuses to start if it cannot chdir to the cwd it
+// inherits, which is not a path that exists in there.
+fn make_sandbox_args(flags: &[u32], net: SandboxNet, fd: i32, args: &[&OsStr]) -> Vec<OsString> {
+    if is_flatpak() {
+        let mut v: Vec<OsString> = vec![
+            "flatpak-spawn".into(),
+            "--sandbox".into(),
+            "--watch-bus".into(),
+            format!("--forward-fd={}", fd).into(),
+            "--directory=/".into(),
+        ];
+        if let SandboxNet::Denied = net {
+            v.push("--no-network".into());
+        }
+        v.extend(flags.iter().map(|f| OsString::from(format!("--sandbox-flag={}", f))));
+        v.extend(args.iter().map(|a| (*a).to_owned()));
+        v
+    } else {
+        args.iter().map(|a| (*a).to_owned()).collect()
+    }
+}
+
+fn app_bin(name: &str) -> OsString {
+    if is_flatpak() {
+        OsString::from(format!("/app/bin/{}", name))
+    } else {
+        OsString::from(name)
+    }
+}
+
 fn flatpak_host_bin(name: &str) -> PathBuf {
     // /.flatpak-info is always readable inside the sandbox and contains
     // app-path=<host path> for the actual installation (user or system).
@@ -142,15 +201,6 @@ fn determine_download_status() -> ImageStatus {
         true => ImageStatus::Present,
         false => ImageStatus::NotPresent,
     };
-}
-
-pub async fn wait_until_exists(file_path: &Path) {
-    loop {
-        match tokio::fs::metadata(file_path).await {
-            Ok(meta) if meta.len() > 0 => return,
-            _ => tokio::time::sleep(std::time::Duration::from_millis(50)).await,
-        }
-    }
 }
 
 pub async fn wait_until_ready(vsock_socket_path: &Path) {
@@ -524,14 +574,11 @@ impl AsyncFactoryComponent for VmEntry {
                         relm4::spawn_local(async move {
                             let config = load_config(&vm_name);
                             let crosvm_socket_path = image_base_path.join("crosvm_socket");
-                            let passt_socket_path = Path::new("/tmp").join(format!("passt_socket_{}", vm_name.clone()));
-                            let passt_pid_path = image_base_path.join("passt.pid");
                             let image_disk_path = image_base_path.join("disk.img");
                             let image_linuz_path = image_base_path.join("vmlinuz");
                             let image_initrd_path = image_base_path.join("initrd.img");
                             let _ = tokio::fs::remove_file(&crosvm_socket_path).await;
                             let _ = tokio::fs::remove_file(&vsock_socket_path).await;
-                            let _ = tokio::fs::remove_file(&passt_pid_path).await;
 
                             let socat_bin: OsString = if is_flatpak() {
                                 flatpak_host_bin("socat").into_os_string()
@@ -551,19 +598,15 @@ impl AsyncFactoryComponent for VmEntry {
                                 SubprocessFlags::empty()
                             ).expect("start of socat process");
 
-                            let passt_bin: OsString = if is_flatpak() {
-                                flatpak_host_bin("passt").into_os_string()
-                            } else {
-                                OsString::from("passt")
-                            };
+                            let passt_bin = app_bin("passt");
+                            let (net_backend_fd, net_frontend_fd) = vhost_user_pair();
+                            let net_fd_arg = format!("{}", NET_VHOST_FD);
                             let mut passt_args: Vec<&OsStr> = vec![
                                 passt_bin.as_os_str(),
                                 OsStr::new("-f"),
                                 OsStr::new("--vhost-user"),
-                                OsStr::new("--socket"),
-                                passt_socket_path.as_os_str(),
-                                OsStr::new("--pid"),
-                                passt_pid_path.as_os_str(),
+                                OsStr::new("--fd"),
+                                OsStr::new(&net_fd_arg),
                             ];
                             let ports_joined = config.tcp_ports.join(",");
                             if !ports_joined.is_empty() {
@@ -574,26 +617,36 @@ impl AsyncFactoryComponent for VmEntry {
                                 passt_args.push(OsStr::new("--map-host-loopback"));
                                 passt_args.push(OsStr::new("169.254.0.1"));
                             }
-                            let passt_host_args = make_host_args(&passt_args);
-                            let passt_host_args_ref: Vec<&OsStr> = passt_host_args.iter().map(OsString::as_os_str).collect();
-                            let passt_process = gtk::gio::Subprocess::newv(
-                                &passt_host_args_ref,
-                                SubprocessFlags::empty()
-                            ).expect("start of passt process");
+                            let passt_sandbox_args = make_sandbox_args(&[], SandboxNet::Shared, NET_VHOST_FD, &passt_args);
+                            let passt_args_ref: Vec<&OsStr> = passt_sandbox_args.iter().map(OsString::as_os_str).collect();
+                            let passt_process = spawn_with_fds(&passt_args_ref, vec![(net_backend_fd, NET_VHOST_FD)]);
 
-                            wait_until_exists(&passt_pid_path).await;
-
-                            let crosvm_bin: OsString = if is_flatpak() {
-                                flatpak_host_bin("crosvm").into_os_string()
-                            } else {
-                                OsString::from("crosvm")
-                            };
+                            let crosvm_bin = app_bin("crosvm");
                             let wayland_sock = wayland_sock_path();
+
+                            let (gpu_backend_fd, gpu_frontend_fd) = vhost_user_pair();
+                            let gpu_fd_arg = format!("--fd={}", GPU_VHOST_FD);
+                            let gpu_args = make_sandbox_args(&[SANDBOX_DISPLAY, SANDBOX_GPU], SandboxNet::Denied, GPU_VHOST_FD, &[
+                                crosvm_bin.as_os_str(),
+                                OsStr::new("device"),
+                                OsStr::new("gpu"),
+                                OsStr::new(&gpu_fd_arg),
+                                OsStr::new("--wayland-sock"),
+                                wayland_sock.as_os_str(),
+                                OsStr::new("--params"),
+                                OsStr::new(r#"{"context-types":"cross-domain","displays":[]}"#),
+                            ]);
+                            let gpu_args_ref: Vec<&OsStr> = gpu_args.iter().map(OsString::as_os_str).collect();
+                            let gpu_process = spawn_with_fds(&gpu_args_ref, vec![(gpu_backend_fd, GPU_VHOST_FD)]);
+
                             let vsock_cid = format!("{}", index.current_index() + 10);
-                            let passt_socket_str = format!("net,socket={}", passt_socket_path.to_str().expect("string"));
+                            // Pinned: the guest image matches its network unit on enp0s7.
+                            let passt_socket_str = format!("net,socket=/proc/self/fd/{},pci-address=00:07.0", NET_VHOST_FD);
+                            let gpu_socket_str = format!("gpu,socket=/proc/self/fd/{}", GPU_VHOST_FD);
                             let cpus_str = format!("num-cores={}", config.cpus);
                             let ram_str = format!("{}", config.ram_mb);
-                            let crosvm_host_args = make_host_args(&[
+                            let hostname_param = format!("systemd.hostname={}", vm_name);
+                            let crosvm_args: Vec<&OsStr> = vec![
                                 crosvm_bin.as_os_str(),
                                 OsStr::new("run"),
                                 OsStr::new("--name"),
@@ -610,31 +663,33 @@ impl AsyncFactoryComponent for VmEntry {
                                 crosvm_socket_path.as_os_str(),
                                 OsStr::new("--vsock"),
                                 OsStr::new(&vsock_cid),
-                                OsStr::new("--gpu"),
-                                OsStr::new("context-types=cross-domain,displays=[]"),
-                                OsStr::new("--wayland-sock"),
-                                wayland_sock.as_os_str(),
+                                // Its minijail cannot create namespaces inside the Flatpak.
+                                OsStr::new("--disable-sandbox"),
+                                OsStr::new("--vhost-user"),
+                                OsStr::new(&gpu_socket_str),
                                 OsStr::new("--vhost-user"),
                                 OsStr::new(&passt_socket_str),
                                 OsStr::new("-p"),
                                 OsStr::new("root=/dev/vda2"),
                                 OsStr::new("-p"),
-                                OsStr::new(&format!("systemd.hostname={}", vm_name)),
+                                OsStr::new(&hostname_param),
                                 image_linuz_path.as_os_str(),
-                            ]);
-                            let crosvm_host_args_ref: Vec<&OsStr> = crosvm_host_args.iter().map(OsString::as_os_str).collect();
-                            let crosvm_process = gtk::gio::Subprocess::newv(
-                                &crosvm_host_args_ref,
-                                SubprocessFlags::empty()
-                            ).expect("start of process");
+                            ];
+                            let crosvm_process = spawn_with_fds(
+                                &crosvm_args,
+                                vec![(gpu_frontend_fd, GPU_VHOST_FD), (net_frontend_fd, NET_VHOST_FD)],
+                            );
 
                             wait_until_ready(&vsock_socket_path).await;
                             sender.output(VmStateUpdate::Update(index.clone(), VMStatus::Running)).unwrap();
                             crosvm_process.wait_future().await.expect("vm to stop");
                             socat_process.send_signal(SIGTERM); // Marker: Incompatible with Windows
+                            // Forwarded into the sub-sandboxes by flatpak-spawn.
                             passt_process.send_signal(SIGTERM);
+                            gpu_process.send_signal(SIGTERM);
                             socat_process.wait_future().await.expect("socat to stop");
                             passt_process.wait_future().await.expect("passt to stop");
+                            gpu_process.wait_future().await.expect("gpu device to stop");
                             sender.output(VmStateUpdate::Update(index, VMStatus::NotRunning)).unwrap();
                         });
                     },
