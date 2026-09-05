@@ -13,7 +13,7 @@ async fn main() {
         .route("/shutdown", post(shutdown))
         .route("/spawn-terminal", post(spawn_terminal));
 
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:3000")
+    let listener = tokio::net::TcpListener::bind("0.0.0.0:11111")
         .await
         .unwrap();
     axum::serve(listener, app).await.unwrap();
