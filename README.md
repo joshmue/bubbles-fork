@@ -76,8 +76,9 @@ $ home-manager switch
 
 #### Sound socket forwarding
 
-1. On host: `socat VSOCK-LISTEN:11112,fork UNIX-CONNECT:$XDG_RUNTIME_DIR/pulse/native`
-2. On guest: `mkdir $XDG_RUNTIME_DIR/pulse && sudo chown user: $XDG_RUNTIME_DIR/pulse && socat UNIX-LISTEN:$XDG_RUNTIME_DIR/pulse/native,fork VSOCK-CONNECT:2:11112`
+1. In the bubble's settings: turn on "Map Host Loopback"
+2. On host: `socat TCP-LISTEN:11112,bind=127.0.0.1,fork UNIX-CONNECT:$XDG_RUNTIME_DIR/pulse/native`
+3. On guest: `mkdir $XDG_RUNTIME_DIR/pulse && sudo chown user: $XDG_RUNTIME_DIR/pulse && socat UNIX-LISTEN:$XDG_RUNTIME_DIR/pulse/native,fork TCP:169.254.0.1:11112`
 
 ## Comparisons
 
