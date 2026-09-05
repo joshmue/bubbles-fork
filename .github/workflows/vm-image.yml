@@ -184,7 +184,6 @@ jobs:
           rm /opt/home-manager-bin
 
           systemctl enable bubbles.service
-          systemctl enable bubbles-proxy.service
           systemctl enable firstboot.service
 
           mkdir -p /var/lib/systemd/linger
@@ -217,18 +216,6 @@ jobs:
 
           [Install]
           WantedBy=default.target
-          EOF
-
-          cat > etcsystemdsystem/bubbles-proxy.service <<EOF
-          [Unit]
-          Description=BubblesIntegrationProxy
-          After=firstboot.service
-
-          [Service]
-          ExecStart=/usr/bin/socat VSOCK-LISTEN:11111,fork TCP4-CONNECT:127.0.0.1:3000
-
-          [Install]
-          WantedBy=multi-user.target
           EOF
 
           cat > etcsystemduser/sommelier.service <<EOF

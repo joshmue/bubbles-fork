@@ -12,6 +12,7 @@ use relm4::factory::DynamicIndex;
 use std::{env, fs, path::{Path, PathBuf}, ffi::{OsStr, OsString}};
 use std::os::fd::{BorrowedFd, OwnedFd};
 use std::os::unix::net::UnixStream;
+use std::net::{Ipv4Addr, SocketAddr, TcpListener};
 use libc::SIGTERM;
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncWriteExt, AsyncReadExt};
@@ -64,21 +65,6 @@ pub fn get_data_dir() -> PathBuf {
 
 fn is_flatpak() -> bool {
     Path::new("/.flatpak-info").exists()
-}
-
-fn make_host_args(args: &[&OsStr]) -> Vec<OsString> {
-    if is_flatpak() {
-        let uid = unsafe { libc::getuid() };
-        let mut v: Vec<OsString> = vec![
-            "flatpak-spawn".into(),
-            "--host".into(),
-            format!("--env=XDG_RUNTIME_DIR=/run/user/{}", uid).into(),
-        ];
-        v.extend(args.iter().map(|a| (*a).to_owned()));
-        v
-    } else {
-        args.iter().map(|a| (*a).to_owned()).collect()
-    }
 }
 
 // Each vhost-user link gets one number, used by both its ends, since it is
@@ -138,20 +124,6 @@ fn app_bin(name: &str) -> OsString {
     }
 }
 
-fn flatpak_host_bin(name: &str) -> PathBuf {
-    // /.flatpak-info is always readable inside the sandbox and contains
-    // app-path=<host path> for the actual installation (user or system).
-    if let Ok(content) = fs::read_to_string("/.flatpak-info") {
-        for line in content.lines() {
-            if let Some(path) = line.strip_prefix("app-path=") {
-                return PathBuf::from(path).join("bin").join(name);
-            }
-        }
-    }
-    // Fallback for non-sandbox use
-    PathBuf::from(name)
-}
-
 fn wayland_sock_path() -> PathBuf {
     if is_flatpak() {
         let uid = unsafe { libc::getuid() };
@@ -164,8 +136,22 @@ fn wayland_sock_path() -> PathBuf {
     }
 }
 
-async fn unix_http(socket: &Path, method: &str, path: &str) -> std::io::Result<String> {
-    let mut stream = tokio::net::UnixStream::connect(socket).await?;
+const AGENT_PORT: u16 = 11111;
+
+// Find unbound localhost ip+port
+fn claim_agent_addr() -> SocketAddr {
+    // 127.0.0.2 through 127.255.255.254
+    for host in 2..=0xff_ff_fe_u32 {
+        let addr = SocketAddr::from((Ipv4Addr::from(0x7f00_0000 | host), AGENT_PORT));
+        if TcpListener::bind(addr).is_ok() {
+            return addr;
+        }
+    }
+    panic!("found no unused loopback address for the agent");
+}
+
+async fn agent_http(addr: SocketAddr, method: &str, path: &str) -> std::io::Result<String> {
+    let mut stream = tokio::net::TcpStream::connect(addr).await?;
     // Content-Length: 0 included for POST correctness; harmless on GET
     let req = format!(
         "{} {} HTTP/1.0\r\nHost: localhost\r\nContent-Length: 0\r\n\r\n",
@@ -203,10 +189,10 @@ fn determine_download_status() -> ImageStatus {
     };
 }
 
-pub async fn wait_until_ready(vsock_socket_path: &Path) {
+pub async fn wait_until_ready(addr: SocketAddr) {
     loop {
-        match unix_http(vsock_socket_path, "GET", "/ready").await {
-            Ok(response) if response.contains("200") => return,
+        match tokio::time::timeout(std::time::Duration::from_secs(2), agent_http(addr, "GET", "/ready")).await {
+            Ok(Ok(response)) if response.contains("200") => return,
             _ => {
                 tokio::time::sleep(std::time::Duration::from_millis(500)).await;
             }
@@ -214,12 +200,12 @@ pub async fn wait_until_ready(vsock_socket_path: &Path) {
     }
 }
 
-pub async fn request_shutdown(vsock_socket_path: &Path) {
-    unix_http(vsock_socket_path, "POST", "/shutdown").await.ok();
+pub async fn request_shutdown(addr: SocketAddr) {
+    agent_http(addr, "POST", "/shutdown").await.ok();
 }
 
-pub async fn request_terminal(vsock_socket_path: &Path) {
-    unix_http(vsock_socket_path, "POST", "/spawn-terminal").await.ok();
+pub async fn request_terminal(addr: SocketAddr) {
+    agent_http(addr, "POST", "/spawn-terminal").await.ok();
 }
 
 // Pinned VM image release. Bump both when publishing a new vm-image-* release:
@@ -429,6 +415,7 @@ enum VMStatus {
 struct VM {
     name: String,
     status: VMStatus,
+    agent_addr: Option<SocketAddr>,
 }
 
 fn load_vms() -> Vec<VM> {
@@ -444,6 +431,7 @@ fn load_vms() -> Vec<VM> {
         vms.push(VM {
             name: vm_name.clone(),
             status: VMStatus::NotRunning,
+            agent_addr: None,
         });
     }
     return vms;
@@ -555,7 +543,6 @@ impl AsyncFactoryComponent for VmEntry {
     async fn update(&mut self, msg: Self::Input, sender: AsyncFactorySender<Self>) {
         let vm_name: String = self.value.name.clone();
         let image_base_path = get_data_dir().join("vms").join(vm_name.clone());
-        let vsock_socket_path = image_base_path.join("vsock");
         match msg {
             VmMsg::OpenSettings(_index) => {
                 sender.output(VmStateUpdate::OpenSettings(vm_name)).unwrap();
@@ -563,13 +550,16 @@ impl AsyncFactoryComponent for VmEntry {
             VmMsg::PowerToggle(index) => {
                 match self.value.status {
                     VMStatus::Running => {
+                        let agent_addr = self.value.agent_addr.expect("a running bubble to hold an agent address");
                         sender.output(VmStateUpdate::Update(index, VMStatus::InFlux)).unwrap();
                         relm4::spawn_local(async move {
-                            request_shutdown(&vsock_socket_path).await;
+                            request_shutdown(agent_addr).await;
                         });
                     },
                     VMStatus::InFlux => {},
                     VMStatus::NotRunning => {
+                        let agent_addr = claim_agent_addr();
+                        self.value.agent_addr = Some(agent_addr);
                         sender.output(VmStateUpdate::Update(index.clone(), VMStatus::InFlux)).unwrap();
                         relm4::spawn_local(async move {
                             let config = load_config(&vm_name);
@@ -578,25 +568,6 @@ impl AsyncFactoryComponent for VmEntry {
                             let image_linuz_path = image_base_path.join("vmlinuz");
                             let image_initrd_path = image_base_path.join("initrd.img");
                             let _ = tokio::fs::remove_file(&crosvm_socket_path).await;
-                            let _ = tokio::fs::remove_file(&vsock_socket_path).await;
-
-                            let socat_bin: OsString = if is_flatpak() {
-                                flatpak_host_bin("socat").into_os_string()
-                            } else {
-                                OsString::from("socat")
-                            };
-                            let socat_unix = format!("UNIX-LISTEN:{},fork", vsock_socket_path.to_str().expect("string"));
-                            let socat_vsock = format!("VSOCK-CONNECT:{}:11111", index.current_index() + 10);
-                            let socat_host_args = make_host_args(&[
-                                socat_bin.as_os_str(),
-                                OsStr::new(&socat_unix),
-                                OsStr::new(&socat_vsock),
-                            ]);
-                            let socat_host_args_ref: Vec<&OsStr> = socat_host_args.iter().map(OsString::as_os_str).collect();
-                            let socat_process = gtk::gio::Subprocess::newv(
-                                &socat_host_args_ref,
-                                SubprocessFlags::empty()
-                            ).expect("start of socat process");
 
                             let passt_bin = app_bin("passt");
                             let (net_backend_fd, net_frontend_fd) = vhost_user_pair();
@@ -608,6 +579,12 @@ impl AsyncFactoryComponent for VmEntry {
                                 OsStr::new("--fd"),
                                 OsStr::new(&net_fd_arg),
                             ];
+                            // Bound to this bubble's own address, which keeps it
+                            // clear of the other bubbles and of the host's
+                            // services, and off every interface but loopback.
+                            let agent_forward = format!("{}/{}", agent_addr.ip(), AGENT_PORT);
+                            passt_args.push(OsStr::new("--tcp-ports"));
+                            passt_args.push(OsStr::new(&agent_forward));
                             let ports_joined = config.tcp_ports.join(",");
                             if !ports_joined.is_empty() {
                                 passt_args.push(OsStr::new("--tcp-ports"));
@@ -639,8 +616,7 @@ impl AsyncFactoryComponent for VmEntry {
                             let gpu_args_ref: Vec<&OsStr> = gpu_args.iter().map(OsString::as_os_str).collect();
                             let gpu_process = spawn_with_fds(&gpu_args_ref, vec![(gpu_backend_fd, GPU_VHOST_FD)]);
 
-                            let vsock_cid = format!("{}", index.current_index() + 10);
-                            // Pinned: the guest image matches its network unit on enp0s7.
+                            // Pinning pci address to match image's enp0s7
                             let passt_socket_str = format!("net,socket=/proc/self/fd/{},pci-address=00:07.0", NET_VHOST_FD);
                             let gpu_socket_str = format!("gpu,socket=/proc/self/fd/{}", GPU_VHOST_FD);
                             let cpus_str = format!("num-cores={}", config.cpus);
@@ -661,9 +637,7 @@ impl AsyncFactoryComponent for VmEntry {
                                 image_initrd_path.as_os_str(),
                                 OsStr::new("--socket"),
                                 crosvm_socket_path.as_os_str(),
-                                OsStr::new("--vsock"),
-                                OsStr::new(&vsock_cid),
-                                // Its minijail cannot create namespaces inside the Flatpak.
+                                // Sandboxing implemented using flatpak sandboxing instead
                                 OsStr::new("--disable-sandbox"),
                                 OsStr::new("--vhost-user"),
                                 OsStr::new(&gpu_socket_str),
@@ -680,14 +654,11 @@ impl AsyncFactoryComponent for VmEntry {
                                 vec![(gpu_frontend_fd, GPU_VHOST_FD), (net_frontend_fd, NET_VHOST_FD)],
                             );
 
-                            wait_until_ready(&vsock_socket_path).await;
+                            wait_until_ready(agent_addr).await;
                             sender.output(VmStateUpdate::Update(index.clone(), VMStatus::Running)).unwrap();
                             crosvm_process.wait_future().await.expect("vm to stop");
-                            socat_process.send_signal(SIGTERM); // Marker: Incompatible with Windows
-                            // Forwarded into the sub-sandboxes by flatpak-spawn.
-                            passt_process.send_signal(SIGTERM);
+                            passt_process.send_signal(SIGTERM); // Marker: Incompatible with Windows
                             gpu_process.send_signal(SIGTERM);
-                            socat_process.wait_future().await.expect("socat to stop");
                             passt_process.wait_future().await.expect("passt to stop");
                             gpu_process.wait_future().await.expect("gpu device to stop");
                             sender.output(VmStateUpdate::Update(index, VMStatus::NotRunning)).unwrap();
@@ -696,8 +667,9 @@ impl AsyncFactoryComponent for VmEntry {
                 }
             },
             VmMsg::StartTerminal(_index) => {
+                let agent_addr = self.value.agent_addr.expect("a running bubble to hold an agent address");
                 relm4::spawn_local(async move {
-                    request_terminal(&vsock_socket_path).await;
+                    request_terminal(agent_addr).await;
                 });
             }
         }
