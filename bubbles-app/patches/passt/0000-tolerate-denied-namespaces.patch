@@ -1,0 +1,35 @@
+diff --git a/isolation.c b/isolation.c
+index c944fb3..1efa092 100644
+--- a/isolation.c
++++ b/isolation.c
+@@ -261,7 +261,7 @@ void isolate_user(uid_t uid, gid_t gid, bool use_userns, const char *userns,
+ 
+ 	} else if (use_userns) { /* Create and join a new userns */
+ 		if (unshare(CLONE_NEWUSER) != 0)
+-			die_perror("Couldn't create user namespace");
++			warn_perror("Couldn't create user namespace");
+ 	}
+ 
+ 	/* Joining a new userns gives us full capabilities; drop the
+@@ -316,8 +316,11 @@ int isolate_prefork(const struct ctx *c)
+ 		flags |= CLONE_NEWPID;
+ 
+ 	if (unshare(flags)) {
+-		err_perror("Failed to detach isolating namespaces");
+-		return -errno;
++		/* Without a mount namespace of our own, the mounts below would
++		 * act on the one we share with whoever denied us ours.
++		 */
++		warn_perror("Failed to detach isolating namespaces");
++		goto drop_caps;
+ 	}
+ 
+ 	if (mount("", "/", "", MS_UNBINDABLE | MS_REC, NULL)) {
+@@ -350,6 +353,7 @@ int isolate_prefork(const struct ctx *c)
+ 	/* Now that initialization is more-or-less complete, we can
+ 	 * drop further capabilities
+ 	 */
++drop_caps:
+ 	if (c->mode == MODE_PASTA) {
+ 		/* Keep CAP_SYS_ADMIN, so we can enter the netns */
+ 		ns_caps |= BIT(CAP_SYS_ADMIN);
