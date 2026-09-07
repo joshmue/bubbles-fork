@@ -64,10 +64,6 @@ pub fn get_data_dir() -> PathBuf {
     base.join("bubbles")
 }
 
-fn is_flatpak() -> bool {
-    Path::new("/.flatpak-info").exists()
-}
-
 // Each vhost-user link gets one number, used by both its ends, since it is
 // baked into their argv. 3 is the first descriptor free after stdio.
 const GPU_VHOST_FD: i32 = 3;
@@ -100,20 +96,17 @@ fn spawn_sandboxed(
     fds: Vec<(OwnedFd, i32)>,
     args: &[&OsStr],
 ) -> gtk::gio::Subprocess {
-    let mut argv: Vec<OsString> = vec![];
-    if is_flatpak() {
-        argv.extend([
-            "flatpak-spawn".into(),
-            "--sandbox".into(),
-            "--watch-bus".into(),
-            "--directory=/".into(),
-        ]);
-        argv.extend(fds.iter().map(|(_, target)| OsString::from(format!("--forward-fd={}", target))));
-        if let SandboxNet::Denied = net {
-            argv.push("--no-network".into());
-        }
-        argv.extend(flags.iter().map(|f| OsString::from(format!("--sandbox-flag={}", f))));
+    let mut argv: Vec<OsString> = vec![
+        "flatpak-spawn".into(),
+        "--sandbox".into(),
+        "--watch-bus".into(),
+        "--directory=/".into(),
+    ];
+    argv.extend(fds.iter().map(|(_, target)| OsString::from(format!("--forward-fd={}", target))));
+    if let SandboxNet::Denied = net {
+        argv.push("--no-network".into());
     }
+    argv.extend(flags.iter().map(|f| OsString::from(format!("--sandbox-flag={}", f))));
     argv.extend(args.iter().map(|a| (*a).to_owned()));
 
     let launcher = gtk::gio::SubprocessLauncher::new(SubprocessFlags::empty());
@@ -126,10 +119,6 @@ fn spawn_sandboxed(
     launcher.spawn(&argv_ref).expect("start of sandboxed process")
 }
 
-fn fd_path(fd: i32) -> OsString {
-    OsString::from(format!("/proc/self/fd/{}", fd))
-}
-
 fn open_fd(path: &Path, write: bool) -> OwnedFd {
     OpenOptions::new()
         .read(true)
@@ -139,24 +128,10 @@ fn open_fd(path: &Path, write: bool) -> OwnedFd {
         .into()
 }
 
-fn app_bin(name: &str) -> OsString {
-    if is_flatpak() {
-        OsString::from(format!("/app/bin/{}", name))
-    } else {
-        OsString::from(name)
-    }
-}
-
 fn wayland_sock_path() -> PathBuf {
-    if is_flatpak() {
-        let uid = unsafe { libc::getuid() };
-        let display = env::var("WAYLAND_DISPLAY").expect("WAYLAND_DISPLAY");
-        PathBuf::from(format!("/run/user/{}/{}", uid, display))
-    } else {
-        let runtime_dir = env::var("XDG_RUNTIME_DIR").expect("XDG_RUNTIME_DIR");
-        let display = env::var("WAYLAND_DISPLAY").expect("WAYLAND_DISPLAY");
-        PathBuf::from(runtime_dir).join(display)
-    }
+    let runtime_dir = env::var("XDG_RUNTIME_DIR").expect("XDG_RUNTIME_DIR");
+    let display = env::var("WAYLAND_DISPLAY").expect("WAYLAND_DISPLAY");
+    PathBuf::from(runtime_dir).join(display)
 }
 
 const AGENT_PORT: u16 = 11111;
@@ -590,11 +565,10 @@ impl AsyncFactoryComponent for VmEntry {
                             let image_linuz_path = image_base_path.join("vmlinuz");
                             let image_initrd_path = image_base_path.join("initrd.img");
 
-                            let passt_bin = app_bin("passt");
                             let (net_backend_fd, net_frontend_fd) = vhost_user_pair();
                             let net_fd_arg = format!("{}", NET_VHOST_FD);
                             let mut passt_args: Vec<&OsStr> = vec![
-                                passt_bin.as_os_str(),
+                                OsStr::new("/app/bin/passt"),
                                 OsStr::new("-f"),
                                 OsStr::new("--vhost-user"),
                                 OsStr::new("--fd"),
@@ -622,7 +596,6 @@ impl AsyncFactoryComponent for VmEntry {
                                 &passt_args,
                             );
 
-                            let crosvm_bin = app_bin("crosvm");
                             let wayland_sock = wayland_sock_path();
 
                             let (gpu_backend_fd, gpu_frontend_fd) = vhost_user_pair();
@@ -632,7 +605,7 @@ impl AsyncFactoryComponent for VmEntry {
                                 SandboxNet::Denied,
                                 vec![(gpu_backend_fd, GPU_VHOST_FD)],
                                 &[
-                                    crosvm_bin.as_os_str(),
+                                    OsStr::new("/app/bin/crosvm"),
                                     OsStr::new("device"),
                                     OsStr::new("gpu"),
                                     OsStr::new(&gpu_fd_arg),
@@ -652,14 +625,14 @@ impl AsyncFactoryComponent for VmEntry {
                             let passt_socket_str = format!("net,socket=/proc/self/fd/{},pci-address=00:07.0", NET_VHOST_FD);
                             let gpu_socket_str = format!("gpu,socket=/proc/self/fd/{}", GPU_VHOST_FD);
                             let hypervisor_str = format!("kvm[device=/proc/self/fd/{}]", KVM_FD);
-                            let disk_str = fd_path(DISK_FD);
-                            let initrd_str = fd_path(INITRD_FD);
-                            let kernel_str = fd_path(KERNEL_FD);
+                            let disk_str = format!("/proc/self/fd/{}", DISK_FD);
+                            let initrd_str = format!("/proc/self/fd/{}", INITRD_FD);
+                            let kernel_str = format!("/proc/self/fd/{}", KERNEL_FD);
                             let cpus_str = format!("num-cores={}", config.cpus);
                             let ram_str = format!("{}", config.ram_mb);
                             let hostname_param = format!("systemd.hostname={}", vm_name);
                             let crosvm_args: Vec<&OsStr> = vec![
-                                crosvm_bin.as_os_str(),
+                                OsStr::new("/app/bin/crosvm"),
                                 OsStr::new("run"),
                                 OsStr::new("--name"),
                                 OsStr::new(&vm_name),
@@ -670,9 +643,9 @@ impl AsyncFactoryComponent for VmEntry {
                                 OsStr::new("--hypervisor"),
                                 OsStr::new(&hypervisor_str),
                                 OsStr::new("--rwdisk"),
-                                disk_str.as_os_str(),
+                                OsStr::new(&disk_str),
                                 OsStr::new("--initrd"),
-                                initrd_str.as_os_str(),
+                                OsStr::new(&initrd_str),
                                 // Sandboxing implemented using flatpak sandboxing instead
                                 OsStr::new("--disable-sandbox"),
                                 OsStr::new("--vhost-user"),
@@ -683,7 +656,7 @@ impl AsyncFactoryComponent for VmEntry {
                                 OsStr::new("root=/dev/vda2"),
                                 OsStr::new("-p"),
                                 OsStr::new(&hostname_param),
-                                kernel_str.as_os_str(),
+                                OsStr::new(&kernel_str),
                             ];
                             let crosvm_process = spawn_sandboxed(
                                 &[],
