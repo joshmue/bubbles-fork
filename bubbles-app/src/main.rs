@@ -21,28 +21,42 @@ use tokio::io::{AsyncWriteExt, AsyncReadExt};
 use preferences::{BubbleSettingsDialog, BubbleSettingsMsg, BubbleSettingsOutput};
 
 
-// define static FD numbers
-// stdio uses 0, 1, 2; start at 3
+pub fn get_data_dir() -> PathBuf {
+    let base = env::var("XDG_DATA_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from(env::var("HOME").expect("HOME")).join(".local/share"));
+    base.join("bubbles")
+}
+
+// Each vhost-user link gets one number, used by both its ends, since it is
+// baked into their argv. 3 is the first descriptor free after stdio.
 const GPU_VHOST_FD: i32 = 3;
 const NET_VHOST_FD: i32 = 4;
-const DISK_FD: i32 = 5;
-const INITRD_FD: i32 = 6;
-const KERNEL_FD: i32 = 7;
+// crosvm's own sandbox holds no path we could name, so everything it opens
+// arrives the same way. crosvm dups these rather than reopening them, except
+// for the KVM node, which it reopens through the link.
+const KVM_FD: i32 = 5;
+const DISK_FD: i32 = 6;
+const INITRD_FD: i32 = 7;
+const KERNEL_FD: i32 = 8;
 
-struct SandboxSettings {
-    network: bool,
-    display: bool,
-    gpu: bool,
-    kvm: bool,
-}
+const SANDBOX_DISPLAY: u32 = 1;
+const SANDBOX_GPU: u32 = 4;
+
+enum SandboxNet { Denied, Shared }
 
 fn vhost_user_pair() -> (OwnedFd, OwnedFd) {
     let (backend, frontend) = UnixStream::pair().expect("socketpair for the vhost-user link");
     (backend.into(), frontend.into())
 }
 
+// Run the argv in a portal sub-sandbox, which holds none of our permissions
+// except the `flags` bits. Network is not one of those bits, so it stays shared
+// unless denied here. bwrap refuses to start if it cannot chdir to the cwd it
+// inherits, which is not a path that exists in there.
 fn spawn_sandboxed(
-    sandbox_settings: SandboxSettings,
+    flags: &[u32],
+    net: SandboxNet,
     fds: Vec<(OwnedFd, i32)>,
     args: &[&OsStr],
 ) -> gtk::gio::Subprocess {
@@ -53,18 +67,10 @@ fn spawn_sandboxed(
         "--directory=/".into(),
     ];
     argv.extend(fds.iter().map(|(_, target)| OsString::from(format!("--forward-fd={}", target))));
-    if !sandbox_settings.network {
+    if let SandboxNet::Denied = net {
         argv.push("--no-network".into());
     }
-    if sandbox_settings.display {
-        argv.push("--sandbox-flag=share-display".into());
-    }
-    if sandbox_settings.gpu {
-        argv.push("--sandbox-flag=share-gpu".into());
-    }
-    if sandbox_settings.kvm {
-        argv.push("--sandbox-flag=share-kvm".into());
-    }
+    argv.extend(flags.iter().map(|f| OsString::from(format!("--sandbox-flag={}", f))));
     argv.extend(args.iter().map(|a| (*a).to_owned()));
 
     let launcher = gtk::gio::SubprocessLauncher::new(SubprocessFlags::empty());
@@ -547,12 +553,8 @@ impl AsyncFactoryComponent for VmEntry {
                                 passt_args.push(OsStr::new("169.254.0.1"));
                             }
                             let passt_process = spawn_sandboxed(
-                                SandboxSettings {
-                                    network: true,
-                                    display: false,
-                                    gpu: false,
-                                    kvm: false,
-                                },
+                                &[],
+                                SandboxNet::Shared,
                                 vec![(net_backend_fd, NET_VHOST_FD)],
                                 &passt_args,
                             );
@@ -562,12 +564,8 @@ impl AsyncFactoryComponent for VmEntry {
                             let (gpu_backend_fd, gpu_frontend_fd) = vhost_user_pair();
                             let gpu_fd_arg = format!("--fd={}", GPU_VHOST_FD);
                             let gpu_process = spawn_sandboxed(
-                                SandboxSettings {
-                                    network: false,
-                                    display: true,
-                                    gpu: true,
-                                    kvm: false,
-                                },
+                                &[SANDBOX_DISPLAY, SANDBOX_GPU],
+                                SandboxNet::Denied,
                                 vec![(gpu_backend_fd, GPU_VHOST_FD)],
                                 &[
                                     OsStr::new("/app/bin/crosvm"),
@@ -581,6 +579,7 @@ impl AsyncFactoryComponent for VmEntry {
                                 ],
                             );
 
+                            let kvm_fd = open_fd(Path::new("/dev/kvm"), true);
                             let disk_fd = open_fd(&image_disk_path, true);
                             let initrd_fd = open_fd(&image_initrd_path, false);
                             let kernel_fd = open_fd(&image_linuz_path, false);
@@ -588,6 +587,7 @@ impl AsyncFactoryComponent for VmEntry {
                             // Pinning pci address to match image's enp0s7
                             let passt_socket_str = format!("net,socket=/proc/self/fd/{},pci-address=00:07.0", NET_VHOST_FD);
                             let gpu_socket_str = format!("gpu,socket=/proc/self/fd/{}", GPU_VHOST_FD);
+                            let hypervisor_str = format!("kvm[device=/proc/self/fd/{}]", KVM_FD);
                             let disk_str = format!("/proc/self/fd/{}", DISK_FD);
                             let initrd_str = format!("/proc/self/fd/{}", INITRD_FD);
                             let kernel_str = format!("/proc/self/fd/{}", KERNEL_FD);
@@ -603,6 +603,8 @@ impl AsyncFactoryComponent for VmEntry {
                                 OsStr::new(&cpus_str),
                                 OsStr::new("-m"),
                                 OsStr::new(&ram_str),
+                                OsStr::new("--hypervisor"),
+                                OsStr::new(&hypervisor_str),
                                 OsStr::new("--rwdisk"),
                                 OsStr::new(&disk_str),
                                 OsStr::new("--initrd"),
@@ -620,15 +622,12 @@ impl AsyncFactoryComponent for VmEntry {
                                 OsStr::new(&kernel_str),
                             ];
                             let crosvm_process = spawn_sandboxed(
-                                SandboxSettings {
-                                    network: false,
-                                    display: false,
-                                    gpu: false,
-                                    kvm: true,
-                                },
+                                &[],
+                                SandboxNet::Denied,
                                 vec![
                                     (gpu_frontend_fd, GPU_VHOST_FD),
                                     (net_frontend_fd, NET_VHOST_FD),
+                                    (kvm_fd, KVM_FD),
                                     (disk_fd, DISK_FD),
                                     (initrd_fd, INITRD_FD),
                                     (kernel_fd, KERNEL_FD),
