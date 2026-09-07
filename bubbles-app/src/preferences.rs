@@ -1,3 +1,5 @@
+use crate::config;
+
 use relm4::adw::prelude::*;
 use gtk::prelude::{ButtonExt, EditableExt};
 use relm4::factory::{DynamicIndex, FactoryVecDeque};
@@ -5,10 +7,8 @@ use relm4::prelude::FactoryComponent;
 use relm4::{Component, ComponentController, ComponentParts, ComponentSender, FactorySender, SimpleComponent};
 use std::{fs, path::PathBuf};
 
-use crate::{BubbleConfig, load_config, save_config};
-
 fn disk_path(vm_name: &str) -> PathBuf {
-    crate::get_data_dir().join("vms").join(vm_name).join("disk.img")
+    config::get_data_dir().join("vms").join(vm_name).join("disk.img")
 }
 
 fn disk_size_bytes(vm_name: &str) -> u64 {
@@ -380,7 +380,7 @@ impl SimpleComponent for BubbleSettingsDialog {
             BubbleSettingsMsg::Load(name) => {
                 self.vm_name = name.clone();
                 self.title = format!("{} Settings", name);
-                let config = load_config(&self.vm_name);
+                let config = config::load_config(&self.vm_name);
                 self.cpu_row.set_value(config.cpus as f64);
                 self.ram_row.set_value(config.ram_mb as f64);
                 self.loopback_row.set_active(config.map_host_loopback);
@@ -409,13 +409,13 @@ impl SimpleComponent for BubbleSettingsDialog {
                     .map(|entry| entry.text.trim().to_string())
                     .filter(|s| !s.is_empty() && is_valid_port_entry(s))
                     .collect();
-                let config = BubbleConfig {
+                let config = config::BubbleConfig {
                     cpus: self.cpu_row.value() as u32,
                     ram_mb: self.ram_row.value() as u32,
                     tcp_ports,
                     map_host_loopback: self.loopback_row.is_active(),
                 };
-                save_config(&self.vm_name, &config);
+                config::save_config(&self.vm_name, &config);
             }
             BubbleSettingsMsg::Delete => {
                 let vm_name = self.vm_name.clone();
