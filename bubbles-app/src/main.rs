@@ -1,4 +1,5 @@
 mod preferences;
+mod config;
 
 use relm4::adw::prelude::*;
 use gtk::gio::SubprocessFlags;
@@ -15,51 +16,10 @@ use std::os::fd::{BorrowedFd, OwnedFd};
 use std::os::unix::net::UnixStream;
 use std::net::{Ipv4Addr, SocketAddr, TcpListener};
 use libc::SIGTERM;
-use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncWriteExt, AsyncReadExt};
 
 use preferences::{BubbleSettingsDialog, BubbleSettingsMsg, BubbleSettingsOutput};
 
-#[derive(Serialize, Deserialize, Clone, Debug)]
-pub struct BubbleConfig {
-    pub cpus: u32,
-    pub ram_mb: u32,
-    pub tcp_ports: Vec<String>,
-    pub map_host_loopback: bool,
-}
-
-impl Default for BubbleConfig {
-    fn default() -> Self {
-        Self {
-            cpus: 4,
-            ram_mb: 7000,
-            tcp_ports: vec![],
-            map_host_loopback: false,
-        }
-    }
-}
-
-pub fn get_data_dir() -> PathBuf {
-    PathBuf::from(env::var("XDG_DATA_HOME").expect("XDG_DATA_HOME")).join("bubbles")
-}
-
-fn config_path(vm_name: &str) -> PathBuf {
-    get_data_dir().join("vms").join(vm_name).join("config.json")
-}
-
-pub fn load_config(vm_name: &str) -> BubbleConfig {
-    let path = config_path(vm_name);
-    match fs::read_to_string(&path) {
-        Ok(data) => serde_json::from_str(&data).unwrap_or_default(),
-        Err(_) => BubbleConfig::default(),
-    }
-}
-
-pub fn save_config(vm_name: &str, config: &BubbleConfig) {
-    let path = config_path(vm_name);
-    let data = serde_json::to_string_pretty(config).expect("config to serialize");
-    fs::write(path, data).expect("config to be written");
-}
 
 // define static FD numbers
 // stdio uses 0, 1, 2; start at 3
@@ -109,8 +69,7 @@ fn spawn_sandboxed(
 
     let launcher = gtk::gio::SubprocessLauncher::new(SubprocessFlags::empty());
     for (fd, target) in fds {
-        // SAFETY: take_fd() only reads the target's number, to dup2() onto it in
-        // the child. It never touches a descriptor of ours at that index.
+        // SAFETY: take_fd() uses BorrowedFd only to transport an int to C
         launcher.take_fd(fd, unsafe { BorrowedFd::borrow_raw(target) });
     }
     let argv_ref: Vec<&OsStr> = argv.iter().map(OsString::as_os_str).collect();
@@ -174,7 +133,7 @@ enum ImageStatus {
 }
 
 fn determine_download_status() -> ImageStatus {
-    let images_dir = get_data_dir().join("images");
+    let images_dir = config::get_data_dir().join("images");
     fs::create_dir_all(&images_dir).expect("directory to exist or be created");
 
     let image_exists = images_dir.join(Path::new("debian-13/disk.img")).exists();
@@ -225,7 +184,7 @@ async fn run_checked(argv: &[&OsStr], flags: SubprocessFlags) -> Result<(), Stri
 }
 
 async fn download_image() {
-    let target_dir = get_data_dir().join("images/debian-13");
+    let target_dir = config::get_data_dir().join("images/debian-13");
     let tarball_path = target_dir.join("disk.tar.gz");
     let checkfile_path = target_dir.join("disk.tar.gz.sha256");
     let raw_path = target_dir.join("disk.img");
@@ -415,7 +374,7 @@ struct VM {
 }
 
 fn load_vms() -> Vec<VM> {
-    let vms_dir = get_data_dir().join("vms");
+    let vms_dir = config::get_data_dir().join("vms");
     fs::create_dir_all(&vms_dir).expect("directory to exist or be created");
     let mut vms: Vec<VM> = vec![];
     for dir in fs::read_dir(vms_dir).expect("to exist") {
@@ -435,16 +394,16 @@ fn load_vms() -> Vec<VM> {
 
 async fn create_vm(name: String) {
     println!("starting copy");
-    let vm_dir_path = get_data_dir().join("vms").join(&name);
+    let vm_dir_path = config::get_data_dir().join("vms").join(&name);
     tokio::fs::create_dir_all(&vm_dir_path).await.expect("directories to be created");
-    let image_base_path = get_data_dir().join("images/debian-13");
+    let image_base_path = config::get_data_dir().join("images/debian-13");
     let image_disk_path = image_base_path.join("disk.img");
     let image_linuz_path = image_base_path.join("vmlinuz");
     let image_initrd_path = image_base_path.join("initrd.img");
     tokio::fs::copy(image_disk_path, vm_dir_path.join("disk.img")).await.expect("disk copy to succeed");
     tokio::fs::copy(image_linuz_path, vm_dir_path.join("vmlinuz")).await.expect("vmlinuz copy to succeed");
     tokio::fs::copy(image_initrd_path, vm_dir_path.join("initrd.img")).await.expect("initrd copy to succeed");
-    save_config(&name, &BubbleConfig::default());
+    config::save_config(&name, &config::BubbleConfig::default());
     println!("done copy");
 }
 
@@ -538,7 +497,7 @@ impl AsyncFactoryComponent for VmEntry {
     }
     async fn update(&mut self, msg: Self::Input, sender: AsyncFactorySender<Self>) {
         let vm_name: String = self.value.name.clone();
-        let image_base_path = get_data_dir().join("vms").join(vm_name.clone());
+        let image_base_path = config::get_data_dir().join("vms").join(vm_name.clone());
         match msg {
             VmMsg::OpenSettings(_index) => {
                 sender.output(VmStateUpdate::OpenSettings(vm_name)).unwrap();
@@ -558,7 +517,7 @@ impl AsyncFactoryComponent for VmEntry {
                         self.value.agent_addr = Some(agent_addr);
                         sender.output(VmStateUpdate::Update(index.clone(), VMStatus::InFlux)).unwrap();
                         relm4::spawn_local(async move {
-                            let config = load_config(&vm_name);
+                            let config = config::load_config(&vm_name);
                             let image_disk_path = image_base_path.join("disk.img");
                             let image_linuz_path = image_base_path.join("vmlinuz");
                             let image_initrd_path = image_base_path.join("initrd.img");
@@ -911,7 +870,7 @@ impl SimpleComponent for App {
                 self.settings_dialog.widgets().dialog.present(Some(&self.root));
             }
             AppMsg::DeleteBubble(name) => {
-                let vm_dir = get_data_dir().join("vms").join(&name);
+                let vm_dir = config::get_data_dir().join("vms").join(&name);
                 let _ = fs::remove_dir_all(&vm_dir);
                 let mut guard = self.vms.guard();
                 let mut index = 0;
