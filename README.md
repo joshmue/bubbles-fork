@@ -12,7 +12,7 @@
 
 **Disposable**: Do not break your host; Break your bubble and discard it
 
-**Isolated**: Strong KVM isolation boundary
+**Isolated**: Running as least-privilege flatpak; Strong KVM isolation boundary
 
 **Immutable**: Includes Nix to enable version-controlled, reproducible work environments
 
@@ -72,13 +72,6 @@ $ home-manager switch
 
 - Chromium: `chromium --ozone-platform=wayland`
 - VS Code: `code --ozone-platform=wayland`
-- Firefox: `WAYLAND_DISPLAY=wayland-0 firefox`
-
-#### Sound socket forwarding
-
-1. In the bubble's settings: turn on "Map Host Loopback"
-2. On host: `socat TCP-LISTEN:11112,bind=127.0.0.1,fork UNIX-CONNECT:$XDG_RUNTIME_DIR/pulse/native`
-3. On guest: `mkdir $XDG_RUNTIME_DIR/pulse && sudo chown user: $XDG_RUNTIME_DIR/pulse && socat UNIX-LISTEN:$XDG_RUNTIME_DIR/pulse/native,fork TCP:169.254.0.1:11112`
 
 ## Comparisons
 
