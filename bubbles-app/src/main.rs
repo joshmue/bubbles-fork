@@ -171,8 +171,8 @@ pub async fn request_terminal(addr: SocketAddr) {
 
 // Pinned VM image release. Bump both when publishing a new vm-image-* release:
 // VM_IMAGE_SHA256 is the sha256 of the release's disk.tar.gz asset.
-const VM_IMAGE_TAG: &str = "vm-image-v0.7";
-const VM_IMAGE_SHA256: &str = "1f652960bd5dde0f8ebaccd403c564f19e068720f99fe55c1c9005337915613a";
+const VM_IMAGE_TAG: &str = "vm-image-v1.0";
+const VM_IMAGE_SHA256: &str = "9c00e8d0c0293530840558d110baae633514a415f0629bf4093239ec0d17f6c4";
 
 // Run a subprocess to completion, returning an error instead of panicking so
 // download failures can be surfaced without leaving the UI stuck.
