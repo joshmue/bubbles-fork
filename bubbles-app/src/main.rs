@@ -899,6 +899,6 @@ impl SimpleComponent for App {
 }
 
 fn main() {
-    let app = RelmApp::new("de.gonicus.Bubbles");
+    let app = RelmApp::new("de.gonicus.bubbles");
     app.run::<App>(());
 }

@@ -1,7 +1,8 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <component type="desktop-application">
-  <id>de.gonicus.Bubbles</id>
+  <id>de.gonicus.bubbles</id>
   <name>Bubbles</name>
+  <launchable type="desktop-id">de.gonicus.bubbles.desktop</launchable>
   <summary>Lightweight Linux working environments</summary>
   <metadata_license>MIT</metadata_license>
   <project_license>MIT</project_license>
