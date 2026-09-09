@@ -1,4 +1,4 @@
-<img src="bubbles-app/de.gonicus.Bubbles.svg" width="120"/>
+<img src="bubbles-app/de.gonicus.bubbles.svg" width="120"/>
 
 # Bubbles - lightweight Linux working environments
 
@@ -29,7 +29,7 @@ Download the flatpak file for the latest `app-v*` release from [releases](https:
 Install it:
 
 ```
-flatpak install --bundle $HOME/Downloads/de.gonicus.Bubbles.flatpak
+flatpak install --bundle $HOME/Downloads/de.gonicus.bubbles.flatpak
 ```
 
 ### Run

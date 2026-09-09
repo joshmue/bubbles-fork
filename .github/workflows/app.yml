@@ -26,12 +26,12 @@ jobs:
       - name: Build Flatpak
         run: |
           flatpak-builder --user --install --force-clean build-dir \
-            bubbles-app/de.gonicus.Bubbles.yml
+            bubbles-app/de.gonicus.bubbles.yml
 
       - name: Bundle Flatpak
         run: |
           flatpak build-bundle ~/.local/share/flatpak/repo \
-            de.gonicus.Bubbles.flatpak de.gonicus.Bubbles
+            de.gonicus.bubbles.flatpak de.gonicus.bubbles
 
       - name: Create GitHub release
         env:
@@ -40,4 +40,4 @@ jobs:
           gh release create "${{ github.ref_name }}" \
             --title "${{ github.ref_name }}" \
             --generate-notes \
-            de.gonicus.Bubbles.flatpak
+            de.gonicus.bubbles.flatpak

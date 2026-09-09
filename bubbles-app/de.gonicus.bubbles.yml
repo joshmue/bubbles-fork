@@ -1,4 +1,4 @@
-app-id: de.gonicus.Bubbles
+app-id: de.gonicus.bubbles
 runtime: org.gnome.Platform
 runtime-version: '49'
 sdk: org.gnome.Sdk
@@ -26,7 +26,7 @@ modules:
     build-commands:
       - cargo --offline build --release
       - install -Dm755 target/release/crosvm /app/bin/crosvm
-      - install -Dm644 crosvm-patches/LICENSE /app/share/licenses/de.gonicus.Bubbles/crosvm/LICENSE
+      - install -Dm644 crosvm-patches/LICENSE /app/share/licenses/de.gonicus.bubbles/crosvm/LICENSE
     sources:
       - type: git
         name: crosvm
@@ -50,8 +50,8 @@ modules:
       - make passt passt.avx2
       - install -Dm755 passt /app/bin/passt
       - install -Dm755 passt.avx2 /app/bin/passt.avx2
-      - install -Dm644 LICENSES/GPL-2.0-or-later.txt /app/share/licenses/de.gonicus.Bubbles/passt/GPL-2.0-or-later.txt
-      - install -Dm644 LICENSES/BSD-3-Clause.txt /app/share/licenses/de.gonicus.Bubbles/passt/BSD-3-Clause.txt
+      - install -Dm644 LICENSES/GPL-2.0-or-later.txt /app/share/licenses/de.gonicus.bubbles/passt/GPL-2.0-or-later.txt
+      - install -Dm644 LICENSES/BSD-3-Clause.txt /app/share/licenses/de.gonicus.bubbles/passt/BSD-3-Clause.txt
     sources:
       - type: archive
         url: https://passt.top/passt/snapshot/passt-2025_05_07.eea8a76.tar.gz
@@ -67,9 +67,9 @@ modules:
     build-commands:
       - cargo --offline build --release
       - install -Dm755 target/release/bubbles /app/bin/bubbles
-      - install -Dm644 de.gonicus.Bubbles.desktop /app/share/applications/de.gonicus.Bubbles.desktop
-      - install -Dm644 de.gonicus.Bubbles.appdata.xml /app/share/metainfo/de.gonicus.Bubbles.appdata.xml
-      - install -Dm644 de.gonicus.Bubbles.svg /app/share/icons/hicolor/scalable/apps/de.gonicus.Bubbles.svg
+      - install -Dm644 de.gonicus.bubbles.desktop /app/share/applications/de.gonicus.bubbles.desktop
+      - install -Dm644 de.gonicus.bubbles.metainfo.xml /app/share/metainfo/de.gonicus.bubbles.metainfo.xml
+      - install -Dm644 de.gonicus.bubbles.svg /app/share/icons/hicolor/scalable/apps/de.gonicus.bubbles.svg
     sources:
       - type: dir
         path: .
