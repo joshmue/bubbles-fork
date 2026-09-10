@@ -22,6 +22,15 @@
 
 <img src="bubbles-app/demo.png"/>
 
+<details>
+<summary>Screenshots</summary>
+
+<img src="bubbles-app/01-pre-create.png"/>
+<img src="bubbles-app/02-create.png"/>
+<img src="bubbles-app/03-settings.png"/>
+
+</details>
+
 ## Getting started
 
 Download the flatpak file for the latest `app-v*` release from [releases](https://github.com/gonicus/bubbles/releases).
