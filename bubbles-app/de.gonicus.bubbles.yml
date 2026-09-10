@@ -26,7 +26,7 @@ modules:
     build-commands:
       - cargo --offline build --release
       - install -Dm755 target/release/crosvm /app/bin/crosvm
-      - install -Dm644 crosvm-patches/LICENSE /app/share/licenses/de.gonicus.bubbles/crosvm/LICENSE
+      - install -Dm644 LICENSE /app/share/licenses/de.gonicus.bubbles/crosvm/LICENSE
     sources:
       - type: git
         url: https://chromium.googlesource.com/crosvm/crosvm
@@ -38,10 +38,6 @@ modules:
           - patches/crosvm/0002-display-backend-stub.patch
           - patches/crosvm/0003-seccomp-madvise-guard.patch
           - patches/crosvm/0004-remove-wayland-display.patch
-      - type: file
-        path: patches/crosvm/LICENSE
-        dest: crosvm-patches
-        dest-filename: LICENSE
       - crosvm-cargo-sources.json
   - name: passt
     buildsystem: simple
