@@ -2,10 +2,10 @@ app-id: de.gonicus.bubbles
 runtime: org.gnome.Platform
 runtime-version: '50'
 sdk: org.gnome.Sdk
+command: bubbles
 sdk-extensions:
   - org.freedesktop.Sdk.Extension.rust-stable
   - org.freedesktop.Sdk.Extension.llvm20
-command: bubbles
 finish-args:
   - --share=ipc
   - --socket=wayland
