@@ -99,16 +99,12 @@ fn wayland_sock_path() -> PathBuf {
 
 const AGENT_PORT: u16 = 11111;
 
-// Find unbound localhost ip+port
+// Only the guest side is pinned to AGENT_PORT: inside a bubble that port is
+// already held by that bubble's own agent, on every address.
 fn claim_agent_addr() -> SocketAddr {
-    // 127.0.0.2 through 127.255.255.254
-    for host in 2..=0xff_ff_fe_u32 {
-        let addr = SocketAddr::from((Ipv4Addr::from(0x7f00_0000 | host), AGENT_PORT));
-        if TcpListener::bind(addr).is_ok() {
-            return addr;
-        }
-    }
-    panic!("found no unused loopback address for the agent");
+    let probe = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+        .expect("a free loopback port for the agent");
+    probe.local_addr().expect("the probe socket to have an address")
 }
 
 async fn agent_http(addr: SocketAddr, method: &str, path: &str) -> std::io::Result<String> {
@@ -537,10 +533,12 @@ impl AsyncFactoryComponent for VmEntry {
                                 OsStr::new("--fd"),
                                 OsStr::new(&net_fd_arg),
                             ];
-                            // Bound to this bubble's own address, which keeps it
+                            // Bound to this bubble's own port, which keeps it
                             // clear of the other bubbles and of the host's
                             // services, and off every interface but loopback.
-                            let agent_forward = format!("{}/{}", agent_addr.ip(), AGENT_PORT);
+                            let agent_forward = format!(
+                                "{}/{}:{}", agent_addr.ip(), agent_addr.port(), AGENT_PORT,
+                            );
                             passt_args.push(OsStr::new("--tcp-ports"));
                             passt_args.push(OsStr::new(&agent_forward));
                             let ports_joined = config.tcp_ports.join(",");
