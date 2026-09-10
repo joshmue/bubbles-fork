@@ -128,4 +128,5 @@ Contra Bubbles:
 - rust-gtk4
 - passt
 - distrobuilder
+- Gnome Console
 - ...
