@@ -1,6 +1,6 @@
 app-id: de.gonicus.bubbles
 runtime: org.gnome.Platform
-runtime-version: '49'
+runtime-version: '50'
 sdk: org.gnome.Sdk
 sdk-extensions:
   - org.freedesktop.Sdk.Extension.rust-stable
@@ -29,7 +29,6 @@ modules:
       - install -Dm644 crosvm-patches/LICENSE /app/share/licenses/de.gonicus.bubbles/crosvm/LICENSE
     sources:
       - type: git
-        name: crosvm
         url: https://chromium.googlesource.com/crosvm/crosvm
         commit: a96cb379acf55a75887cbba190666e7d22ff9dbf
       - type: patch
