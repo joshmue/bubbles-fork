@@ -25,9 +25,9 @@
 <details>
 <summary>Screenshots</summary>
 
-<img src="bubbles-app/01-pre-create.png"/>
-<img src="bubbles-app/02-create.png"/>
-<img src="bubbles-app/03-settings.png"/>
+<img src="bubbles-app/screenshots/01-pre-create.png"/>
+<img src="bubbles-app/screenshots/02-create.png"/>
+<img src="bubbles-app/screenshots/03-settings.png"/>
 
 </details>
 
