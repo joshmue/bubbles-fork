@@ -527,6 +527,10 @@ impl AsyncFactoryComponent for VmEntry {
                                 OsStr::new("/app/bin/passt"),
                                 OsStr::new("-f"),
                                 OsStr::new("--vhost-user"),
+                                OsStr::new("--address"),
+                                OsStr::new("10.46.0.3"),
+                                OsStr::new("--netmask"),
+                                OsStr::new("255.255.255.0"),
                                 OsStr::new("--fd"),
                                 OsStr::new(&net_fd_arg),
                             ];
