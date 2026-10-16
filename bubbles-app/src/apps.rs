@@ -13,6 +13,7 @@ use bubbles::agent_request;
 use crate::agents;
 
 use crate::exports;
+use crate::launcher;
 use crate::portal;
 
 const ICON_SIZE: i32 = 32;
@@ -113,6 +114,7 @@ struct AppRow {
 
 #[derive(Debug)]
 enum AppRowOutput {
+    Launch(DynamicIndex),
     Export(DynamicIndex),
     Remove(DynamicIndex),
 }
@@ -136,6 +138,15 @@ impl FactoryComponent for AppRow {
                 set_visible: self.busy,
                 #[watch]
                 set_spinning: self.busy,
+            },
+            add_suffix = &gtk::Button {
+                set_valign: gtk::Align::Center,
+                set_icon_name: "media-playback-start-symbolic",
+                set_css_classes: &["flat"],
+                set_tooltip_text: Some("Start this application in the bubble"),
+                connect_clicked[sender, index] => move |_| {
+                    sender.output(AppRowOutput::Launch(index.clone())).unwrap();
+                }
             },
             add_suffix = &gtk::Button {
                 set_valign: gtk::Align::Center,
@@ -198,6 +209,8 @@ pub enum AppsMsg {
     Refresh,
     Loaded(Box<GuestAppList>),
     Failed(String),
+    Launch(DynamicIndex),
+    LaunchFinished(String, Result<(), String>),
     Export(DynamicIndex),
     Remove(DynamicIndex),
     ExportFinished(String, Result<String, String>),
@@ -283,6 +296,7 @@ impl SimpleComponent for AppsDialog {
         let rows: FactoryVecDeque<AppRow> = FactoryVecDeque::builder()
             .launch_default()
             .forward(sender.input_sender(), |output| match output {
+                AppRowOutput::Launch(index) => AppsMsg::Launch(index),
                 AppRowOutput::Export(index) => AppsMsg::Export(index),
                 AppRowOutput::Remove(index) => AppsMsg::Remove(index),
             });
@@ -325,7 +339,7 @@ impl SimpleComponent for AppsDialog {
                 self.state = ListState::Loading;
                 self.rows.guard().clear();
                 relm4::spawn_local(async move {
-                    match agent_request(addr, hyper::Method::GET, "/desktop-apps").await {
+                    match agent_request(addr, reqwest::Method::GET, "/desktop-apps").await {
                         Ok(response) if response.status == 200 => {
                             match serde_json::from_str::<GuestAppList>(&response.body) {
                                 Ok(list) => sender.input(AppsMsg::Loaded(Box::new(list))),
@@ -367,6 +381,27 @@ impl SimpleComponent for AppsDialog {
                 self.state =
                     ListState::Message("Could not read the application list".to_string(), reason);
             }
+            AppsMsg::Launch(index) => {
+                let Some(app) = self.rows.get(index.current_index()).map(|row| row.app.clone())
+                else {
+                    return;
+                };
+                let Some(addr) = agents::get(&self.bubble) else {
+                    self.report("This bubble is not running");
+                    return;
+                };
+                let bubble = self.bubble.clone();
+                relm4::spawn_local(async move {
+                    let result = launcher::start(addr, &bubble, &app.id)
+                        .await
+                        .map_err(|(_, detail)| detail);
+                    sender.input(AppsMsg::LaunchFinished(app.name, result));
+                });
+            }
+            AppsMsg::LaunchFinished(name, result) => match result {
+                Ok(()) => self.toast(&format!("Starting “{name}”")),
+                Err(error) => self.report(&format!("Could not start “{name}”: {error}")),
+            },
             AppsMsg::Export(index) => {
                 let Some(app) = self.rows.get(index.current_index()).map(|row| row.app.clone())
                 else {

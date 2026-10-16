@@ -25,8 +25,6 @@ use libc::SIGTERM;
 use apps::{AppsDialog, AppsMsg};
 use preferences::{BubbleSettingsDialog, BubbleSettingsMsg, BubbleSettingsOutput};
 
-use bubbles::agent_request;
-use hyper::Method;
 
 
 // static FD numbers
@@ -136,6 +134,14 @@ User=user
 ExecStartPre=+/bin/sh -c 'tar -xf /dev/disk/by-id/virtio-bubbles-agent -C /run/bubbles'
 ExecStart=/run/bubbles/bubbles-agent
 Restart=on-failure
+# Applications the agent starts run under sommelier, which offers
+# Wayland and no X server. Qt5 in particular still defaults to X11.
+Environment=QT_QPA_PLATFORM=wayland
+Environment=ELECTRON_OZONE_PLATFORM_HINT=auto
+Environment=SDL_VIDEODRIVER=wayland
+Environment=CLUTTER_BACKEND=wayland
+Environment=MOZ_ENABLE_WAYLAND=1
+Environment=_JAVA_AWT_WM_NONREPARENTING=1
 ";
 
 // Single-quoted, crosvm's key=value parser takes the base64 and the '=' and ':'
@@ -1003,6 +1009,13 @@ impl SimpleComponent for App {
 }
 
 fn main() {
-    let app = RelmApp::new("de.gonicus.bubbles");
+    let app = RelmApp::new(bubbles::APP_ID);
+    // Exported launchers call in on the name the application already owns; the
+    // bus connection exists from `startup` on.
+    relm4::main_application().connect_startup(|application| {
+        if let Some(connection) = application.dbus_connection() {
+            launcher::register(&connection);
+        }
+    });
     app.run::<App>(());
 }

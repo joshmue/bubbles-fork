@@ -4,6 +4,8 @@
 //! knows a human is waiting behind a menu entry, and only it can put the
 //! failure in front of them.
 
+use std::net::SocketAddr;
+
 use gtk::gio::{self, DBusConnection, DBusMethodInvocation};
 
 use bubbles::{
@@ -15,7 +17,7 @@ use crate::agents;
 
 const INTROSPECTION: &str = r#"
 <node>
-  <interface name="de.gonicus.Bubbles.Launcher">
+  <interface name="de.gonicus.bubbles.Launcher">
     <method name="StartApplication">
       <arg type="s" name="bubble" direction="in"/>
       <arg type="s" name="app_id" direction="in"/>
@@ -60,22 +62,30 @@ fn start_application(bubble: String, app_id: String, invocation: DBusMethodInvoc
         return;
     };
     relm4::spawn_local(async move {
-        match agent_request(addr, hyper::Method::POST, &start_app_path(&app_id)).await {
-            Ok(response) if (200..300).contains(&response.status) => invocation.return_value(None),
-            // The application was uninstalled inside the bubble since it was
-            // exported, which the launcher reports differently.
-            Ok(response) if response.status == 404 => invocation.return_dbus_error(
-                LAUNCHER_NOT_INSTALLED_ERROR,
-                &format!("“{app_id}” is not installed in “{bubble}”"),
-            ),
-            Ok(response) => {
-                let detail = match response.body.trim() {
-                    "" => format!("the bubble answered with status {}", response.status),
-                    body => body.to_string(),
-                };
-                invocation.return_dbus_error(LAUNCHER_FAILED_ERROR, &detail);
-            }
-            Err(error) => invocation.return_dbus_error(LAUNCHER_FAILED_ERROR, &error),
+        match start(addr, &bubble, &app_id).await {
+            Ok(()) => invocation.return_value(None),
+            Err((name, detail)) => invocation.return_dbus_error(name, &detail),
         }
     });
+}
+
+/// On failure, the D-Bus error name the launcher tells apart and a message.
+pub async fn start(addr: SocketAddr, bubble: &str, app_id: &str) -> Result<(), (&'static str, String)> {
+    match agent_request(addr, reqwest::Method::POST, &start_app_path(app_id)).await {
+        Ok(response) if (200..300).contains(&response.status) => Ok(()),
+        // The application was uninstalled inside the bubble since it was
+        // exported, which the launcher reports differently.
+        Ok(response) if response.status == 404 => Err((
+            LAUNCHER_NOT_INSTALLED_ERROR,
+            format!("“{app_id}” is not installed in “{bubble}”"),
+        )),
+        Ok(response) => {
+            let detail = match response.body.trim() {
+                "" => format!("the bubble answered with status {}", response.status),
+                body => body.to_string(),
+            };
+            Err((LAUNCHER_FAILED_ERROR, detail))
+        }
+        Err(error) => Err((LAUNCHER_FAILED_ERROR, error)),
+    }
 }

@@ -6,7 +6,7 @@ use gtk::glib;
 
 use bubbles::{is_flatpak, vm_dir};
 
-pub const APP_ID: &str = "de.gonicus.Bubbles";
+pub const APP_ID: &str = "de.gonicus.bubbles";
 
 /// `desktop_file_id -> the name the launcher carries in the host menu`
 pub type Exports = BTreeMap<String, String>;

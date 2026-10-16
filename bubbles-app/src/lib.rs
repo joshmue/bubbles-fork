@@ -1,22 +1,19 @@
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
-use http_body_util::{BodyExt, Empty, Limited};
-use hyper::body::Bytes;
-use hyper::{Method, Request};
-use hyper_util::rt::TokioIo;
+use reqwest::Method;
 
 pub const MAX_RESPONSE_BYTES: usize = 32 * 1024 * 1024;
 
-pub const APP_ID: &str = "de.gonicus.Bubbles";
+pub const APP_ID: &str = "de.gonicus.bubbles";
 
 // The interface exported launchers call on the running app. Shared so that
 // bubbles-launch and the app cannot drift apart on a name.
-pub const LAUNCHER_INTERFACE: &str = "de.gonicus.Bubbles.Launcher";
-pub const LAUNCHER_OBJECT_PATH: &str = "/de/gonicus/Bubbles/Launcher";
-pub const LAUNCHER_NOT_RUNNING_ERROR: &str = "de.gonicus.Bubbles.Launcher.Error.NotRunning";
-pub const LAUNCHER_NOT_INSTALLED_ERROR: &str = "de.gonicus.Bubbles.Launcher.Error.NotInstalled";
-pub const LAUNCHER_FAILED_ERROR: &str = "de.gonicus.Bubbles.Launcher.Error.Failed";
+pub const LAUNCHER_INTERFACE: &str = "de.gonicus.bubbles.Launcher";
+pub const LAUNCHER_OBJECT_PATH: &str = "/de/gonicus/bubbles/Launcher";
+pub const LAUNCHER_NOT_RUNNING_ERROR: &str = "de.gonicus.bubbles.Launcher.Error.NotRunning";
+pub const LAUNCHER_NOT_INSTALLED_ERROR: &str = "de.gonicus.bubbles.Launcher.Error.NotInstalled";
+pub const LAUNCHER_FAILED_ERROR: &str = "de.gonicus.bubbles.Launcher.Error.Failed";
 
 pub fn get_data_dir() -> PathBuf {
     let base = std::env::var("XDG_DATA_HOME")
@@ -38,44 +35,32 @@ pub struct HttpResponse {
     pub body: String,
 }
 
-/// One request over a fresh connection: the agent speaks HTTP/1 on a loopback
-/// address passt forwards into the bubble, and nothing here is hot enough to
-/// want a pool.
+/// One request to the agent, which speaks HTTP/1 on a loopback address passt
+/// forwards into the bubble.
 pub async fn agent_request(
     addr: SocketAddr,
     method: Method,
     path: &str,
 ) -> Result<HttpResponse, String> {
-    let stream = tokio::net::TcpStream::connect(addr)
-        .await
-        .map_err(|e| format!("no connection to the bubble: {e}"))?;
-    let (mut sender, connection) = hyper::client::conn::http1::handshake(TokioIo::new(stream))
-        .await
-        .map_err(|e| format!("no HTTP connection to the bubble: {e}"))?;
-    // Nothing moves over the socket unless the connection future is polled,
-    // and it ends by itself once the body has been read.
-    tokio::spawn(async move {
-        let _ = connection.await;
-    });
-
-    let request = Request::builder()
-        .method(method)
-        .uri(path)
-        .header(hyper::header::HOST, "localhost")
-        .body(Empty::<Bytes>::new())
-        .map_err(|e| format!("malformed request: {e}"))?;
-    let response = sender
-        .send_request(request)
+    let mut response = reqwest::Client::new()
+        .request(method, format!("http://{addr}{path}"))
+        .send()
         .await
         .map_err(|e| format!("the bubble did not answer: {e}"))?;
 
     let status = response.status().as_u16();
     // The bubble fills this list itself, so the size is not ours to trust.
-    let body = Limited::new(response.into_body(), MAX_RESPONSE_BYTES)
-        .collect()
+    let mut body = Vec::new();
+    while let Some(chunk) = response
+        .chunk()
         .await
         .map_err(|e| format!("could not read the answer: {e}"))?
-        .to_bytes();
+    {
+        if body.len() + chunk.len() > MAX_RESPONSE_BYTES {
+            return Err("could not read the answer: too large".to_string());
+        }
+        body.extend_from_slice(&chunk);
+    }
     Ok(HttpResponse {
         status,
         body: String::from_utf8_lossy(&body).into_owned(),

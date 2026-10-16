@@ -78,6 +78,7 @@ jobs:
               "git",
               "unzip",
               "gnome-console",
+              "gnome-software",
               "libgbm1",
               "libpixman-1-0",
               "libwayland-client0",
@@ -146,6 +147,11 @@ jobs:
                 "generator": "dump",
                 "path": "/etc/nix/nix.conf",
                 "content": "sandbox = true\nexperimental-features = nix-command flakes"
+              },
+              {
+                "generator": "dump",
+                "path": "/etc/polkit-1/rules.d/50-bubbles.rules",
+                "content": "polkit.addRule(function(action, subject) {\n    if (subject.isInGroup(\"sudo\")) {\n        return polkit.Result.YES;\n    }\n});\n"
               },
               {
                 "generator": "copy",

@@ -62,6 +62,8 @@ modules:
     build-commands:
       - cargo --offline build --release --workspace
       - install -Dm755 target/release/bubbles /app/bin/bubbles
+      # What the launchers installed by the Dynamic Launcher Portal run.
+      - install -Dm755 target/release/bubbles-launch /app/bin/bubbles-launch
       - install -Dm755 target/release/bubbles-agent payload/bubbles-agent
       - tar --sort=name --owner=0 --group=0 --numeric-owner --mtime=@0 -cf agent.tar -C payload .
       - install -Dm644 agent.tar /app/share/bubbles/agent.tar

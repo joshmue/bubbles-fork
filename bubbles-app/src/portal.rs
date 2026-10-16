@@ -14,7 +14,7 @@ const REQUEST_INTERFACE: &str = "org.freedesktop.portal.Request";
 // The portal itself rejects anything over 4 MiB, or png/jpeg above 512x512.
 pub const MAX_ICON_BYTES: usize = 1024 * 1024;
 
-const FALLBACK_ICON: &[u8] = include_bytes!("../de.gonicus.Bubbles.svg");
+const FALLBACK_ICON: &[u8] = include_bytes!("../../flatpak/de.gonicus.bubbles.svg");
 
 static AVAILABLE: OnceLock<bool> = OnceLock::new();
 
