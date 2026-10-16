@@ -115,8 +115,7 @@ struct AppRow {
 #[derive(Debug)]
 enum AppRowOutput {
     Launch(DynamicIndex),
-    Export(DynamicIndex),
-    Remove(DynamicIndex),
+    ToggleMenu(DynamicIndex),
 }
 
 #[relm4::factory]
@@ -133,11 +132,13 @@ impl FactoryComponent for AppRow {
             set_title: &glib::markup_escape_text(&self.app.name),
             set_subtitle: &glib::markup_escape_text(&self.app.comment),
             add_prefix: &self.image,
-            add_suffix = &gtk::Spinner {
+            set_activatable: true,
+            connect_activated[sender, index] => move |_| {
+                sender.output(AppRowOutput::Launch(index.clone())).unwrap();
+            },
+            add_suffix = &relm4::adw::Spinner {
                 #[watch]
                 set_visible: self.busy,
-                #[watch]
-                set_spinning: self.busy,
             },
             add_suffix = &gtk::Button {
                 set_valign: gtk::Align::Center,
@@ -150,27 +151,20 @@ impl FactoryComponent for AppRow {
             },
             add_suffix = &gtk::Button {
                 set_valign: gtk::Align::Center,
-                set_label: "Export",
-                set_tooltip_text: Some("Add this application to the host's menu"),
-                #[watch]
-                set_visible: !self.exported,
-                #[watch]
-                set_sensitive: !self.busy,
-                connect_clicked[sender, index] => move |_| {
-                    sender.output(AppRowOutput::Export(index.clone())).unwrap();
-                }
-            },
-            add_suffix = &gtk::Button {
-                set_valign: gtk::Align::Center,
-                set_icon_name: "user-trash-symbolic",
+                set_icon_name: "view-pin-symbolic",
                 set_css_classes: &["flat"],
-                set_tooltip_text: Some("Remove this application from the host's menu"),
                 #[watch]
-                set_visible: self.exported,
+                set_class_active: ("accent", self.exported),
+                #[watch]
+                set_tooltip_text: Some(if self.exported {
+                    "Remove from the host's application menu"
+                } else {
+                    "Add to the host's application menu"
+                }),
                 #[watch]
                 set_sensitive: !self.busy,
                 connect_clicked[sender, index] => move |_| {
-                    sender.output(AppRowOutput::Remove(index.clone())).unwrap();
+                    sender.output(AppRowOutput::ToggleMenu(index.clone())).unwrap();
                 }
             },
         }
@@ -199,7 +193,6 @@ pub struct AppsDialog {
     bubble: String,
     rows: FactoryVecDeque<AppRow>,
     state: ListState,
-    title: String,
     toasts: relm4::adw::ToastOverlay,
 }
 
@@ -211,6 +204,7 @@ pub enum AppsMsg {
     Failed(String),
     Launch(DynamicIndex),
     LaunchFinished(String, Result<(), String>),
+    ToggleMenu(DynamicIndex),
     Export(DynamicIndex),
     Remove(DynamicIndex),
     ExportFinished(String, Result<String, String>),
@@ -227,11 +221,16 @@ impl SimpleComponent for AppsDialog {
         dialog = relm4::adw::Dialog {
             set_content_width: 520,
             set_content_height: 620,
-            #[watch]
-            set_title: &model.title,
+            set_title: "Applications",
             #[wrap(Some)]
             set_child = &relm4::adw::ToolbarView {
                 add_top_bar = &relm4::adw::HeaderBar {
+                    #[wrap(Some)]
+                    set_title_widget = &relm4::adw::WindowTitle {
+                        set_title: "Applications",
+                        #[watch]
+                        set_subtitle: &model.bubble,
+                    },
                     pack_end = &gtk::Button {
                         set_icon_name: "view-refresh-symbolic",
                         set_tooltip_text: Some("Reload the list"),
@@ -247,8 +246,7 @@ impl SimpleComponent for AppsDialog {
                         add_named[Some("loading")] = &relm4::adw::StatusPage {
                             set_title: "Looking for applications",
                             #[wrap(Some)]
-                            set_child = &gtk::Spinner {
-                                set_spinning: true,
+                            set_child = &relm4::adw::Spinner {
                                 set_width_request: 32,
                                 set_height_request: 32,
                             },
@@ -297,8 +295,7 @@ impl SimpleComponent for AppsDialog {
             .launch_default()
             .forward(sender.input_sender(), |output| match output {
                 AppRowOutput::Launch(index) => AppsMsg::Launch(index),
-                AppRowOutput::Export(index) => AppsMsg::Export(index),
-                AppRowOutput::Remove(index) => AppsMsg::Remove(index),
+                AppRowOutput::ToggleMenu(index) => AppsMsg::ToggleMenu(index),
             });
         let rows_listbox_widget = rows.widget().clone();
 
@@ -306,7 +303,6 @@ impl SimpleComponent for AppsDialog {
             bubble: String::new(),
             rows,
             state: ListState::Loading,
-            title: "Applications".to_string(),
             toasts: relm4::adw::ToastOverlay::new(),
         };
 
@@ -321,7 +317,6 @@ impl SimpleComponent for AppsDialog {
         match msg {
             AppsMsg::Load(bubble) => {
                 self.bubble = bubble.clone();
-                self.title = format!("{bubble} Applications");
                 exports::reconcile(&bubble);
                 sender.input(AppsMsg::Refresh);
             }
@@ -402,6 +397,13 @@ impl SimpleComponent for AppsDialog {
                 Ok(()) => self.toast(&format!("Starting “{name}”")),
                 Err(error) => self.report(&format!("Could not start “{name}”: {error}")),
             },
+            AppsMsg::ToggleMenu(index) => {
+                let Some(exported) = self.rows.get(index.current_index()).map(|row| row.exported)
+                else {
+                    return;
+                };
+                sender.input(if exported { AppsMsg::Remove(index) } else { AppsMsg::Export(index) });
+            }
             AppsMsg::Export(index) => {
                 let Some(app) = self.rows.get(index.current_index()).map(|row| row.app.clone())
                 else {
