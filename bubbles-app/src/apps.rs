@@ -324,7 +324,7 @@ impl SimpleComponent for AppsDialog {
                 if self.bubble.is_empty() {
                     return;
                 }
-                let Some(addr) = agents::get(&self.bubble) else {
+                let Some(agent) = agents::get(&self.bubble) else {
                     self.state = ListState::Message(
                         "This bubble is not running".to_string(),
                         "Start it to see the applications installed inside it.".to_string(),
@@ -334,7 +334,7 @@ impl SimpleComponent for AppsDialog {
                 self.state = ListState::Loading;
                 self.rows.guard().clear();
                 relm4::spawn_local(async move {
-                    match agent_request(addr, reqwest::Method::GET, "/desktop-apps").await {
+                    match agent_request(&agent, reqwest::Method::GET, "/desktop-apps").await {
                         Ok(response) if response.status == 200 => {
                             match serde_json::from_str::<GuestAppList>(&response.body) {
                                 Ok(list) => sender.input(AppsMsg::Loaded(Box::new(list))),
@@ -381,13 +381,13 @@ impl SimpleComponent for AppsDialog {
                 else {
                     return;
                 };
-                let Some(addr) = agents::get(&self.bubble) else {
+                let Some(agent) = agents::get(&self.bubble) else {
                     self.report("This bubble is not running");
                     return;
                 };
                 let bubble = self.bubble.clone();
                 relm4::spawn_local(async move {
-                    let result = launcher::start(addr, &bubble, &app.id)
+                    let result = launcher::start(&agent, &bubble, &app.id)
                         .await
                         .map_err(|(_, detail)| detail);
                     sender.input(AppsMsg::LaunchFinished(app.name, result));
@@ -484,7 +484,13 @@ impl AppsDialog {
     // A toast truncates, and a portal error is the one message worth reading in
     // full, so it also goes to stderr.
     fn toast(&self, message: &str) {
-        self.toasts.add_toast(relm4::adw::Toast::new(message));
+        // Names and error bodies come from the guest.
+        self.toasts.add_toast(
+            relm4::adw::Toast::builder()
+                .title(message)
+                .use_markup(false)
+                .build(),
+        );
     }
 
     fn report(&self, message: &str) {

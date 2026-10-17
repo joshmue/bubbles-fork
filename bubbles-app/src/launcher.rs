@@ -4,12 +4,10 @@
 //! knows a human is waiting behind a menu entry, and only it can put the
 //! failure in front of them.
 
-use std::net::SocketAddr;
-
 use gtk::gio::{self, DBusConnection, DBusMethodInvocation};
 
 use bubbles::{
-    agent_request, start_app_path, LAUNCHER_FAILED_ERROR, LAUNCHER_INTERFACE,
+    agent_request, start_app_path, Agent, LAUNCHER_FAILED_ERROR, LAUNCHER_INTERFACE,
     LAUNCHER_NOT_INSTALLED_ERROR, LAUNCHER_NOT_RUNNING_ERROR, LAUNCHER_OBJECT_PATH,
 };
 
@@ -54,7 +52,7 @@ pub fn register(connection: &DBusConnection) {
 }
 
 fn start_application(bubble: String, app_id: String, invocation: DBusMethodInvocation) {
-    let Some(addr) = agents::get(&bubble) else {
+    let Some(agent) = agents::get(&bubble) else {
         invocation.return_dbus_error(
             LAUNCHER_NOT_RUNNING_ERROR,
             &format!("the bubble “{bubble}” is not running"),
@@ -62,7 +60,7 @@ fn start_application(bubble: String, app_id: String, invocation: DBusMethodInvoc
         return;
     };
     relm4::spawn_local(async move {
-        match start(addr, &bubble, &app_id).await {
+        match start(&agent, &bubble, &app_id).await {
             Ok(()) => invocation.return_value(None),
             Err((name, detail)) => invocation.return_dbus_error(name, &detail),
         }
@@ -70,8 +68,8 @@ fn start_application(bubble: String, app_id: String, invocation: DBusMethodInvoc
 }
 
 /// On failure, the D-Bus error name the launcher tells apart and a message.
-pub async fn start(addr: SocketAddr, bubble: &str, app_id: &str) -> Result<(), (&'static str, String)> {
-    match agent_request(addr, reqwest::Method::POST, &start_app_path(app_id)).await {
+pub async fn start(agent: &Agent, bubble: &str, app_id: &str) -> Result<(), (&'static str, String)> {
+    match agent_request(agent, reqwest::Method::POST, &start_app_path(app_id)).await {
         Ok(response) if (200..300).contains(&response.status) => Ok(()),
         // The application was uninstalled inside the bubble since it was
         // exported, which the launcher reports differently.

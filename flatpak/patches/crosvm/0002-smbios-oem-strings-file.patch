@@ -1,0 +1,62 @@
+diff --git a/arch/src/lib.rs b/arch/src/lib.rs
+index 25e641344..0d685883c 100644
+--- a/arch/src/lib.rs
++++ b/arch/src/lib.rs
+@@ -1499,6 +1499,10 @@ pub struct SmbiosOptions {
+     /// Additional OEM strings to add to SMBIOS table.
+     #[serde(default)]
+     pub oem_strings: Vec<String>,
++
++    /// File to read further OEM strings from, one per line. Keeps them off the
++    /// command line, which other processes can read.
++    pub oem_strings_file: Option<PathBuf>,
+ }
+ 
+ #[cfg(test)]
+@@ -1508,6 +1512,14 @@ mod tests {
+ 
+     use super::*;
+ 
++    #[test]
++    fn parse_smbios_oem_strings_file() {
++        let res: SmbiosOptions =
++            from_key_values("oem-strings=[a],oem-strings-file=/proc/self/fd/3").unwrap();
++        assert_eq!(res.oem_strings, vec!["a".to_string()]);
++        assert_eq!(res.oem_strings_file, Some(PathBuf::from("/proc/self/fd/3")));
++    }
++
+     #[test]
+     fn parse_pstore() {
+         let res: Pstore = from_key_values("path=/some/path,size=16384").unwrap();
+diff --git a/src/crosvm/cmdline.rs b/src/crosvm/cmdline.rs
+index 30be42c07..0ec0d0a9e 100644
+--- a/src/crosvm/cmdline.rs
++++ b/src/crosvm/cmdline.rs
+@@ -1992,6 +1992,8 @@ pub struct RunCommand {
+     ///     serial-number=STRING - System serial number.
+     ///     uuid=UUID - System UUID.
+     ///     oem-strings=[...] - Free-form OEM strings (SMBIOS type 11).
++    ///     oem-strings-file=PATH - File with further OEM strings,
++    ///         one per line.
+     pub smbios: Option<SmbiosOptions>,
+ 
+     #[cfg(all(
+@@ -3187,6 +3189,18 @@ impl TryFrom<RunCommand> for super::config::Config {
+             cfg.no_rtc = cmd.no_rtc.unwrap_or_default();
+             cfg.smbios = cmd.smbios.unwrap_or_default();
+ 
++            if let Some(path) = cfg.smbios.oem_strings_file.take() {
++                let content = std::fs::read_to_string(&path).map_err(|e| {
++                    format!("failed to read oem-strings-file {}: {e}", path.display())
++                })?;
++                cfg.smbios.oem_strings.extend(
++                    content
++                        .lines()
++                        .filter(|line| !line.is_empty())
++                        .map(str::to_string),
++                );
++            }
++
+             if let Some(pci_start) = cmd.pci_start {
+                 if cfg.pci_config.mem.is_some() {
+                     return Err("--pci-start cannot be used with --pci mem=[...]".to_string());

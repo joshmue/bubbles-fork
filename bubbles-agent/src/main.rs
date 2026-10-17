@@ -1,28 +1,58 @@
 mod desktop;
 
+use std::sync::Arc;
+
 use axum::{
-    extract::Query,
-    http::StatusCode,
-    response::IntoResponse,
+    extract::{Query, Request, State},
+    http::{header, StatusCode},
+    middleware::{self, Next},
+    response::{IntoResponse, Response},
     routing::{get, post},
     Json, Router,
 };
 use serde::Deserialize;
 use tokio::process;
 
+const TOKEN_CREDENTIAL: &str = "bubbles.agent-token";
+
 #[tokio::main]
 async fn main() {
+    let token = read_token();
     let app = Router::new()
         .route("/ready", get(ready))
         .route("/shutdown", post(shutdown))
         .route("/spawn-terminal", post(spawn_terminal))
         .route("/desktop-apps", get(desktop_apps))
-        .route("/start-desktop-app", post(start_desktop_app));
+        .route("/start-desktop-app", post(start_desktop_app))
+        .layer(middleware::from_fn_with_state(token, authorize));
 
     let listener = tokio::net::TcpListener::bind("0.0.0.0:11111")
         .await
         .unwrap();
     axum::serve(listener, app).await.unwrap();
+}
+
+// The host passes the token as a systemd credential; without one, anyone who
+// can reach the port could drive the bubble, so there is no fallback.
+fn read_token() -> Arc<[u8]> {
+    let directory = std::env::var("CREDENTIALS_DIRECTORY")
+        .unwrap_or_else(|_| panic!("no credentials directory, is {TOKEN_CREDENTIAL} loaded?"));
+    let token = std::fs::read(std::path::Path::new(&directory).join(TOKEN_CREDENTIAL))
+        .unwrap_or_else(|error| panic!("cannot read {TOKEN_CREDENTIAL}: {error}"));
+    let token = token.trim_ascii();
+    assert!(token.len() >= 32, "{TOKEN_CREDENTIAL} is too short");
+    token.into()
+}
+
+async fn authorize(State(token): State<Arc<[u8]>>, request: Request, next: Next) -> Response {
+    let presented = request
+        .headers()
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.as_bytes().strip_prefix(b"Bearer "));
+    match presented {
+        Some(presented) if presented == &token[..] => next.run(request).await,
+        _ => StatusCode::UNAUTHORIZED.into_response(),
+    }
 }
 
 fn spawn_failed(program: &str, error: std::io::Error) -> (StatusCode, String) {

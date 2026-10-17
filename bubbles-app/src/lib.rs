@@ -1,3 +1,4 @@
+use std::io::Read;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
@@ -30,6 +31,25 @@ pub fn vm_dir(bubble: &str) -> PathBuf {
     get_data_dir().join("vms").join(bubble)
 }
 
+/// Where a running bubble's agent listens, and the token it demands.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Agent {
+    pub addr: SocketAddr,
+    pub token: String,
+}
+
+impl Agent {
+    /// A fresh token for each boot, so one that leaks does not outlive it.
+    pub fn new(addr: SocketAddr) -> Self {
+        let mut bytes = [0u8; 32];
+        std::fs::File::open("/dev/urandom")
+            .and_then(|mut random| random.read_exact(&mut bytes))
+            .expect("random bytes for the agent token");
+        let token = bytes.iter().map(|byte| format!("{byte:02x}")).collect();
+        Self { addr, token }
+    }
+}
+
 pub struct HttpResponse {
     pub status: u16,
     pub body: String,
@@ -38,12 +58,13 @@ pub struct HttpResponse {
 /// One request to the agent, which speaks HTTP/1 on a loopback address passt
 /// forwards into the bubble.
 pub async fn agent_request(
-    addr: SocketAddr,
+    agent: &Agent,
     method: Method,
     path: &str,
 ) -> Result<HttpResponse, String> {
     let mut response = reqwest::Client::new()
-        .request(method, format!("http://{addr}{path}"))
+        .request(method, format!("http://{}{path}", agent.addr))
+        .bearer_auth(&agent.token)
         .send()
         .await
         .map_err(|e| format!("the bubble did not answer: {e}"))?;

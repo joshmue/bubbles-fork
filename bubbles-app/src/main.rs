@@ -16,11 +16,14 @@ use relm4::{
 };
 use relm4::factory::DynamicIndex;
 use std::{env, fs, path::{Path, PathBuf}, ffi::{OsStr, OsString}};
-use std::fs::OpenOptions;
-use std::os::fd::{BorrowedFd, OwnedFd};
+use std::fs::{File, OpenOptions};
+use std::io::Write;
+use std::os::fd::{BorrowedFd, FromRawFd, OwnedFd};
 use std::os::unix::net::UnixStream;
 use std::net::{Ipv4Addr, SocketAddr, TcpListener};
 use libc::SIGTERM;
+
+use bubbles::{agent_request, Agent};
 
 use apps::{AppsDialog, AppsMsg};
 use preferences::{BubbleSettingsDialog, BubbleSettingsMsg, BubbleSettingsOutput};
@@ -36,6 +39,7 @@ const DISK_FD: i32 = 6;
 const INITRD_FD: i32 = 7;
 const KERNEL_FD: i32 = 8;
 const AGENT_DISK_FD: i32 = 9;
+const OEM_STRINGS_FD: i32 = 10;
 
 // Mirror relevant flatpak-spawn's sandbox flag numbers
 // Newer flatpak portal versions support non-magic-number flags
@@ -89,6 +93,21 @@ fn open_fd(path: &Path, write: bool) -> OwnedFd {
         .into()
 }
 
+// In memory rather than on the command line, which every process on the host
+// can read through /proc.
+fn oem_strings_fd(strings: &[String]) -> OwnedFd {
+    // SAFETY: a static NUL-terminated name; the fd is fresh and owned by File alone.
+    let mut file = unsafe {
+        let fd = libc::memfd_create(c"bubbles-oem-strings".as_ptr(), libc::MFD_CLOEXEC);
+        assert!(fd >= 0, "memfd for the OEM strings: {}", std::io::Error::last_os_error());
+        File::from_raw_fd(fd)
+    };
+    for string in strings {
+        writeln!(file, "{string}").expect("OEM strings to fit in memory");
+    }
+    file.into()
+}
+
 fn wayland_sock_path() -> PathBuf {
     let runtime_dir = env::var("XDG_RUNTIME_DIR").expect("XDG_RUNTIME_DIR");
     let display = env::var("WAYLAND_DISPLAY").expect("WAYLAND_DISPLAY");
@@ -134,6 +153,7 @@ User=user
 ExecStartPre=+/bin/sh -c 'tar -xf /dev/disk/by-id/virtio-bubbles-agent -C /run/bubbles'
 ExecStart=/run/bubbles/bubbles-agent
 Restart=on-failure
+LoadCredential=bubbles.agent-token
 # Applications the agent starts run under sommelier, which offers
 # Wayland and no X server. Qt5 in particular still defaults to X11.
 Environment=QT_QPA_PLATFORM=wayland
@@ -144,10 +164,8 @@ Environment=MOZ_ENABLE_WAYLAND=1
 Environment=_JAVA_AWT_WM_NONREPARENTING=1
 ";
 
-// Single-quoted, crosvm's key=value parser takes the base64 and the '=' and ':'
-// around it literally.
 fn credential_oem_string(name: &str, content: &str) -> String {
-    format!("'io.systemd.credential.binary:{}={}'", name, gtk::glib::base64_encode(content.as_bytes()))
+    format!("io.systemd.credential.binary:{}={}", name, gtk::glib::base64_encode(content.as_bytes()))
 }
 
 struct CreateBubbleDialog {
@@ -176,11 +194,10 @@ fn determine_download_status() -> ImageStatus {
     };
 }
 
-pub async fn wait_until_ready(addr: SocketAddr) {
-    let client = reqwest::Client::new();
+pub async fn wait_until_ready(agent: &Agent) {
     loop {
-        match tokio::time::timeout(std::time::Duration::from_secs(2), client.get(format!("http://{addr}/ready")).send()).await {
-            Ok(Ok(response)) if response.status() == 200 => return,
+        match tokio::time::timeout(std::time::Duration::from_secs(2), agent_request(agent, reqwest::Method::GET, "/ready")).await {
+            Ok(Ok(response)) if response.status == 200 => return,
             _ => {
                 tokio::time::sleep(std::time::Duration::from_millis(500)).await;
             }
@@ -188,18 +205,16 @@ pub async fn wait_until_ready(addr: SocketAddr) {
     }
 }
 
-pub async fn request_shutdown(addr: SocketAddr) -> bool {
-    let client = reqwest::Client::new();
-    return match client.post(format!("http://{addr}/shutdown")).send().await {
-        Ok(response) if response.status() == 201 => true,
+pub async fn request_shutdown(agent: &Agent) -> bool {
+    return match agent_request(agent, reqwest::Method::POST, "/shutdown").await {
+        Ok(response) if response.status == 201 => true,
         _ => false
     };
 }
 
-pub async fn request_terminal(addr: SocketAddr) -> bool {
-    let client = reqwest::Client::new();
-    return match client.post(format!("http://{addr}/spawn-terminal")).send().await {
-        Ok(response) if response.status() == 201 => true,
+pub async fn request_terminal(agent: &Agent) -> bool {
+    return match agent_request(agent, reqwest::Method::POST, "/spawn-terminal").await {
+        Ok(response) if response.status == 201 => true,
         _ => false
     };
 }
@@ -404,7 +419,7 @@ enum VMStatus {
 struct VM {
     name: String,
     status: VMStatus,
-    agent_addr: Option<SocketAddr>,
+    agent: Option<Agent>,
 }
 
 fn load_vms() -> Vec<VM> {
@@ -420,7 +435,7 @@ fn load_vms() -> Vec<VM> {
         vms.push(VM {
             name: vm_name.clone(),
             status: VMStatus::NotRunning,
-            agent_addr: None,
+            agent: None,
         });
     }
     return vms;
@@ -566,17 +581,17 @@ impl AsyncFactoryComponent for VmEntry {
             VmMsg::PowerToggle(index) => {
                 match self.value.status {
                     VMStatus::Running => {
-                        let agent_addr = self.value.agent_addr.expect("a running bubble to hold an agent address");
+                        let agent = self.value.agent.clone().expect("a running bubble to hold an agent");
                         relm4::spawn_local(async move {
-                            if request_shutdown(agent_addr).await {
+                            if request_shutdown(&agent).await {
                                 sender.output(VmStateUpdate::Update(index, VMStatus::InFlux)).unwrap();
                             }
                         });
                     },
                     VMStatus::InFlux => {},
                     VMStatus::NotRunning => {
-                        let agent_addr = claim_agent_addr();
-                        self.value.agent_addr = Some(agent_addr);
+                        let agent = Agent::new(claim_agent_addr());
+                        self.value.agent = Some(agent.clone());
                         sender.output(VmStateUpdate::Update(index.clone(), VMStatus::InFlux)).unwrap();
                         relm4::spawn_local(async move {
                             let config = config::load_config(&vm_name);
@@ -597,7 +612,7 @@ impl AsyncFactoryComponent for VmEntry {
                             // clear of the other bubbles and of the host's
                             // services, and off every interface but loopback.
                             let agent_forward = format!(
-                                "{}/{}:{}", agent_addr.ip(), agent_addr.port(), AGENT_PORT,
+                                "{}/{}:{}", agent.addr.ip(), agent.addr.port(), AGENT_PORT,
                             );
                             passt_args.push(OsStr::new("--tcp-ports"));
                             passt_args.push(OsStr::new(&agent_forward));
@@ -646,6 +661,11 @@ impl AsyncFactoryComponent for VmEntry {
                             let initrd_fd = open_fd(&image_initrd_path, false);
                             let kernel_fd = open_fd(&image_linuz_path, false);
                             let agent_disk_fd = open_fd(Path::new(AGENT_PAYLOAD_PATH), false);
+                            let oem_strings_fd = oem_strings_fd(&[
+                                credential_oem_string("systemd.extra-unit.run-bubbles.mount", AGENT_MOUNT_UNIT),
+                                credential_oem_string("systemd.extra-unit.bubbles-agent.service", AGENT_SERVICE_UNIT),
+                                credential_oem_string("bubbles.agent-token", &agent.token),
+                            ]);
 
                             // Pinning pci address to match image's enp0s7
                             let passt_socket_str = format!("net,socket=/proc/self/fd/{},pci-address=00:07.0", NET_VHOST_FD);
@@ -661,11 +681,7 @@ impl AsyncFactoryComponent for VmEntry {
                                 "/proc/self/fd/{},ro=true,id=bubbles-agent,pci-address={}",
                                 AGENT_DISK_FD, AGENT_DISK_PCI_ADDRESS,
                             );
-                            let smbios_str = format!(
-                                "oem-strings=[{},{}]",
-                                credential_oem_string("systemd.extra-unit.run-bubbles.mount", AGENT_MOUNT_UNIT),
-                                credential_oem_string("systemd.extra-unit.bubbles-agent.service", AGENT_SERVICE_UNIT),
-                            );
+                            let smbios_str = format!("oem-strings-file=/proc/self/fd/{}", OEM_STRINGS_FD);
                             let crosvm_args: Vec<&OsStr> = vec![
                                 OsStr::new("/app/bin/crosvm"),
                                 OsStr::new("run"),
@@ -718,13 +734,14 @@ impl AsyncFactoryComponent for VmEntry {
                                     (initrd_fd, INITRD_FD),
                                     (kernel_fd, KERNEL_FD),
                                     (agent_disk_fd, AGENT_DISK_FD),
+                                    (oem_strings_fd, OEM_STRINGS_FD),
                                 ],
                                 &crosvm_args,
                             );
 
-                            wait_until_ready(agent_addr).await;
+                            wait_until_ready(&agent).await;
                             // Only now can a launcher reach it.
-                            agents::set(&vm_name, agent_addr);
+                            agents::set(&vm_name, agent);
                             sender.output(VmStateUpdate::Update(index.clone(), VMStatus::Running)).unwrap();
                             crosvm_process.wait_future().await.expect("vm to stop");
                             agents::clear(&vm_name);
@@ -738,9 +755,9 @@ impl AsyncFactoryComponent for VmEntry {
                 }
             },
             VmMsg::StartTerminal(_index) => {
-                let agent_addr = self.value.agent_addr.expect("a running bubble to hold an agent address");
+                let agent = self.value.agent.clone().expect("a running bubble to hold an agent");
                 relm4::spawn_local(async move {
-                    request_terminal(agent_addr).await;
+                    request_terminal(&agent).await;
                 });
             }
         }
