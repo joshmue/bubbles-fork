@@ -174,6 +174,19 @@ Environment=MOZ_ENABLE_WAYLAND=1
 Environment=_JAVA_AWT_WM_NONREPARENTING=1
 ";
 
+// Sommelier, a user service of the image, prefixes guest windows' app_ids with
+// its VM id. Set to the bubble's name, launchers from different bubbles do not
+// claim each other's windows; see exports::host_app_id. tmpfiles expands the
+// \n, and bubble names hold no % it would expand too.
+fn sommelier_vm_id_tmpfiles(bubble: &str) -> String {
+    format!(
+        "d /run/systemd/user 0755 root root -\n\
+         d /run/systemd/user/sommelier.service.d 0755 root root -\n\
+         f+ /run/systemd/user/sommelier.service.d/bubbles.conf 0644 root root - \
+         [Service]\\nEnvironment=SOMMELIER_VM_IDENTIFIER={bubble}\\n\n"
+    )
+}
+
 fn credential_oem_string(name: &str, content: &str) -> String {
     format!("io.systemd.credential.binary:{}={}", name, gtk::glib::base64_encode(content.as_bytes()))
 }
@@ -678,6 +691,7 @@ impl AsyncFactoryComponent for VmEntry {
                                 credential_oem_string("systemd.extra-unit.run-bubbles.mount", AGENT_MOUNT_UNIT),
                                 credential_oem_string("systemd.extra-unit.bubbles-agent.service", AGENT_SERVICE_UNIT),
                                 credential_oem_string("bubbles.agent-token", &agent.token),
+                                credential_oem_string("tmpfiles.extra", &sommelier_vm_id_tmpfiles(&vm_name)),
                             ]);
 
                             // Pinning pci address to match image's enp0s7

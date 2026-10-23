@@ -1,4 +1,4 @@
-use gtk::gdk_pixbuf::Pixbuf;
+use gtk::gdk_pixbuf::{Colorspace, InterpType, Pixbuf};
 use gtk::gio;
 use gtk::glib;
 use gtk::prelude::*;
@@ -11,6 +11,10 @@ use serde::Deserialize;
 use crate::agent::{agent_request, Agent};
 
 const ICON_SIZE: i32 = 32;
+const EXPORT_ICON_SIZE: i32 = 256;
+const BADGE_SIZE: i32 = EXPORT_ICON_SIZE * 2 / 5;
+
+const BUBBLES_ICON: &[u8] = include_bytes!("../../flatpak/de.gonicus.bubbles.svg");
 
 #[derive(Deserialize, Debug, Clone)]
 struct GuestIcon {
@@ -49,17 +53,56 @@ fn icon_bytes(app: &GuestApp) -> Option<Vec<u8>> {
 }
 
 // Via gdk-pixbuf, not Texture::from_bytes, which cannot read the SVGs most
-// icon themes ship.
+// icon themes ship. The bytes come from the guest: gdk-pixbuf hands them to
+// glycin, whose loaders run in a sandbox of their own, so a decoder bug stays
+// out of this process, which can read every bubble's disk.
+fn decode_icon(app: &GuestApp, size: i32) -> Option<Pixbuf> {
+    load_pixbuf(&glib::Bytes::from_owned(icon_bytes(app)?), size)
+}
+
+fn load_pixbuf(bytes: &glib::Bytes, size: i32) -> Option<Pixbuf> {
+    let stream = gio::MemoryInputStream::from_bytes(bytes);
+    Pixbuf::from_stream_at_scale(&stream, size, size, true, gio::Cancellable::NONE).ok()
+}
+
+// Draws `source` onto `canvas` unscaled, its top left corner at (x, y).
+fn draw(source: &Pixbuf, canvas: &Pixbuf, x: i32, y: i32) {
+    let (width, height) = (source.width(), source.height());
+    source.composite(
+        canvas, x, y, width, height, x.into(), y.into(), 1.0, 1.0, InterpType::Bilinear, 255,
+    );
+}
+
+// The host's shell decodes an exported icon itself, unsandboxed and with
+// whatever libpng or librsvg the host has. So it gets a PNG encoded here from
+// decoded pixels, never the guest's bytes. SVGs end up rasterised.
+//
+// Our logo in the bottom right corner marks the launcher as one for a bubble.
+fn export_icon(app: &GuestApp) -> Option<Vec<u8>> {
+    let icon = decode_icon(app, EXPORT_ICON_SIZE)?;
+    let badge = load_pixbuf(&glib::Bytes::from_static(BUBBLES_ICON), BADGE_SIZE)?;
+
+    let canvas = Pixbuf::new(Colorspace::Rgb, true, 8, EXPORT_ICON_SIZE, EXPORT_ICON_SIZE)?;
+    canvas.fill(0);
+    // Centred, as the icon need not be square.
+    draw(
+        &icon,
+        &canvas,
+        (EXPORT_ICON_SIZE - icon.width()) / 2,
+        (EXPORT_ICON_SIZE - icon.height()) / 2,
+    );
+    draw(
+        &badge,
+        &canvas,
+        EXPORT_ICON_SIZE - badge.width(),
+        EXPORT_ICON_SIZE - badge.height(),
+    );
+    Some(gtk::gdk::Texture::for_pixbuf(&canvas).save_to_png_bytes().to_vec())
+}
+
 fn row_image(app: &GuestApp) -> gtk::Image {
-    let texture = icon_bytes(app).and_then(|bytes| {
-        let stream = gio::MemoryInputStream::from_bytes(&glib::Bytes::from_owned(bytes));
-        let pixbuf =
-            Pixbuf::from_stream_at_scale(&stream, ICON_SIZE, ICON_SIZE, true, gio::Cancellable::NONE)
-                .ok()?;
-        Some(gtk::gdk::Texture::for_pixbuf(&pixbuf))
-    });
-    let image = match texture {
-        Some(texture) => gtk::Image::from_paintable(Some(&texture)),
+    let image = match decode_icon(app, ICON_SIZE) {
+        Some(pixbuf) => gtk::Image::from_paintable(Some(&gtk::gdk::Texture::for_pixbuf(&pixbuf))),
         None => gtk::Image::from_icon_name("application-x-executable"),
     };
     image.set_pixel_size(ICON_SIZE);
@@ -468,7 +511,7 @@ impl AppsDialog {
 /// The name the launcher ended up with, `None` if the user cancelled.
 async fn export_one(bubble: &str, app: &GuestApp) -> Result<Option<String>, String> {
     let proposed = format!("{} ({bubble})", app.name);
-    let Some(token) = portal::prepare_install(&proposed, icon_bytes(app)).await? else {
+    let Some(token) = portal::prepare_install(&proposed, export_icon(app)).await? else {
         return Ok(None);
     };
 
@@ -554,11 +597,25 @@ pub mod exports {
         if !comment.is_empty() {
             key_file.set_string("Desktop Entry", "Comment", comment);
         }
-        if !wm_class.is_empty() {
-            key_file.set_string("Desktop Entry", "StartupWMClass", wm_class);
-        }
+        // How the shell finds the launcher for a running window.
+        key_file.set_string(
+            "Desktop Entry",
+            "StartupWMClass",
+            &host_app_id(bubble, guest_app_id, wm_class),
+        );
         key_file.set_string("Desktop Entry", "X-Bubbles-Bubble", bubble);
         key_file.to_data().to_string()
+    }
+
+    /// The app_id a guest window of this application has on the host: sommelier
+    /// prefixes it with the VM id, which each boot sets to the bubble's name.
+    /// An application without StartupWMClass usually uses its desktop file id.
+    fn host_app_id(bubble: &str, guest_app_id: &str, wm_class: &str) -> String {
+        let guest = match wm_class {
+            "" => guest_app_id.strip_suffix(".desktop").unwrap_or(guest_app_id),
+            wm_class => wm_class,
+        };
+        format!("org.chromium.guest_os.{bubble}.wayland.{guest}")
     }
 
     #[cfg(test)]
@@ -600,6 +657,18 @@ pub mod exports {
             assert_eq!(
                 key_file.string("Desktop Entry", "Exec").unwrap(),
                 exec_line("work", "chromium.desktop")
+            );
+        }
+
+        #[test]
+        fn windows_find_their_launcher() {
+            assert_eq!(
+                host_app_id("work", "org.gnome.TextEditor.desktop", ""),
+                "org.chromium.guest_os.work.wayland.org.gnome.TextEditor"
+            );
+            assert_eq!(
+                host_app_id("work", "firefox-esr.desktop", "firefox-esr"),
+                "org.chromium.guest_os.work.wayland.firefox-esr"
             );
         }
     }
@@ -742,7 +811,6 @@ pub mod portal {
     use gtk::gio::prelude::*;
     use gtk::gio::{self, DBusProxy, DBusProxyFlags};
 
-    const FALLBACK_ICON: &[u8] = include_bytes!("../../flatpak/de.gonicus.bubbles.svg");
 
     static AVAILABLE: OnceLock<bool> = OnceLock::new();
 
@@ -776,7 +844,7 @@ pub mod portal {
     pub async fn prepare_install(name: &str, icon: Option<Vec<u8>>) -> Result<Option<String>, String> {
         // The portal accepts icon bytes only, so an application without an icon of
         // its own is exported under ours rather than a named fallback.
-        let icon = Icon::Bytes(icon.unwrap_or_else(|| FALLBACK_ICON.to_vec()));
+        let icon = Icon::Bytes(icon.unwrap_or_else(|| super::BUBBLES_ICON.to_vec()));
         let options = PrepareInstallOptions::default()
             .set_editable_name(true)
             .set_editable_icon(true);
